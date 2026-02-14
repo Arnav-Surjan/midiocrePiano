@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from pathlib import Path
 from typing import List, Dict
+import threading
 
 import requests
 from bs4 import BeautifulSoup
@@ -166,15 +167,34 @@ class MidiUploader(tk.Tk):
         if not save_path:
             return
 
-        try:
-            download_midi_file(download_url, save_path)
-        except Exception as exc:  # pragma: no cover - network errors
-            messagebox.showerror("Download Error", f"Could not download MIDI file: {exc}")
-            return
+        # Disable the button while downloading to prevent duplicate clicks.
+        self.download_button.config(state=tk.DISABLED)
 
-        self.selected_file = Path(save_path)
-        self.file_label.config(text=f"Selected file: {self.selected_file.name}")
-        messagebox.showinfo("Download Complete", "MIDI file downloaded and loaded successfully.")
+        def do_download() -> None:
+            error: Exception | None = None
+            try:
+                download_midi_file(download_url, save_path)
+            except Exception as exc:  # pragma: no cover - network errors
+                error = exc
+
+            def on_complete() -> None:
+                if error is not None:
+                    messagebox.showerror("Download Error", f"Could not download MIDI file: {error}")
+                else:
+                    self.selected_file = Path(save_path)
+                    self.file_label.config(text=f"Selected file: {self.selected_file.name}")
+                    messagebox.showinfo("Download Complete", "MIDI file downloaded and loaded successfully.")
+
+                # Re-enable the button only if there is a current selection.
+                if self.search_results and self.results_listbox.curselection():
+                    self.download_button.config(state=tk.NORMAL)
+                else:
+                    self.download_button.config(state=tk.DISABLED)
+
+            # Marshal UI updates back to the main Tkinter thread.
+            self.after(0, on_complete)
+
+        threading.Thread(target=do_download, daemon=True).start()
 
     def _set_search_placeholder(self) -> None:
         self.search_entry.delete(0, tk.END)
