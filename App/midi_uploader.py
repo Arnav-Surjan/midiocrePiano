@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
+from tkinter import ttk
 from pathlib import Path
 from typing import List, Dict
 import threading
@@ -7,6 +8,8 @@ import threading
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus, urljoin
+
+from midi_to_solenoid import midi_to_solenoid_events
 
 
 COMMON_HEADERS = {
@@ -32,9 +35,19 @@ class MidiUploader(tk.Tk):
         self.file_label = tk.Label(self, text="No MIDI file selected.", padx=20, pady=10)
         self.file_label.pack()
 
+        # Process button (created but not shown until a MIDI file is selected)
+        # Explicit colors avoid the "greyed out" look on some platforms.
+        self.process_button = tk.Button(
+            self,
+            text="Process",
+            command=self.open_process_page,
+            bg="white",
+            fg="black",
+        )
+
         # Upload MIDI file button
-        select_button = tk.Button(self, text="Upload MIDI File", command=self.select_file)
-        select_button.pack(pady=(0, 5))
+        self.upload_button = tk.Button(self, text="Upload MIDI File", command=self.select_file)
+        self.upload_button.pack(pady=(5, 5))
         
         # "OR" separator
         or_label = tk.Label(self, text="OR")
@@ -80,6 +93,7 @@ class MidiUploader(tk.Tk):
         # Track visibility of results widgets
         self.results_visible = False
 
+
     def select_file(self) -> None:
         file_path = filedialog.askopenfilename(
             title="Select a MIDI file",
@@ -98,6 +112,7 @@ class MidiUploader(tk.Tk):
 
         self.selected_file = path
         self.file_label.config(text=f"Selected file: {path.name}")
+        self._show_process_button()
 
     def perform_search(self, event=None) -> None:
         query = self.search_entry.get().strip()
@@ -185,6 +200,9 @@ class MidiUploader(tk.Tk):
                     self.file_label.config(text=f"Selected file: {self.selected_file.name}")
                     messagebox.showinfo("Download Complete", "MIDI file downloaded and loaded successfully.")
 
+                    # A MIDI file is now available to process.
+                    self._show_process_button()
+
                 # Re-enable the button only if there is a current selection.
                 if self.search_results and self.results_listbox.curselection():
                     self.download_button.config(state=tk.NORMAL)
@@ -236,6 +254,83 @@ class MidiUploader(tk.Tk):
             self.download_button.config(state=tk.NORMAL)
         else:
             self.download_button.config(state=tk.DISABLED)
+
+    def _show_process_button(self) -> None:
+        """Show the Process button once a MIDI file is selected."""
+
+        if self.selected_file is None:
+            return
+
+        if not self.process_button.winfo_ismapped():
+                # Place the Process button directly under the selected-file label
+                # and above the Upload button for a clear linear flow.
+                self.process_button.pack(pady=(10, 20), before=self.upload_button)
+
+    def open_process_page(self) -> None:
+        """Open a simple processing window and convert the selected MIDI file.
+
+        Conversion is done in a background thread while this window shows
+        status/progress so the main UI stays responsive.
+        """
+
+        if self.selected_file is None:
+            messagebox.showinfo("Process", "Please select a MIDI file first.")
+            return
+
+        process_window = tk.Toplevel(self)
+        process_window.title("Processing MIDI")
+        process_window.resizable(False, False)
+
+        status_label = tk.Label(process_window, text="Starting conversion...")
+        status_label.pack(padx=20, pady=(20, 10))
+
+        progress_bar = ttk.Progressbar(process_window, mode="indeterminate", length=260)
+        progress_bar.pack(padx=20, pady=(0, 10))
+        progress_bar.start(10)
+
+        details_label = tk.Label(process_window, text="", wraplength=320, justify=tk.LEFT)
+        details_label.pack(padx=20, pady=(0, 10))
+
+        close_button = tk.Button(process_window, text="Close", command=process_window.destroy, state=tk.DISABLED)
+        close_button.pack(pady=(0, 20))
+
+        # Prevent starting multiple conversions at once from the main window.
+        self.process_button.config(state=tk.DISABLED)
+
+        def worker() -> None:
+            error: Exception | None = None
+            data = None
+            try:
+                data = midi_to_solenoid_events(self.selected_file)
+            except Exception as exc:  # pragma: no cover - unexpected errors
+                error = exc
+
+            def on_complete() -> None:
+                progress_bar.stop()
+
+                if error is not None:
+                    status_label.config(text="Conversion failed.")
+                    details_label.config(text=f"Error: {error}")
+                else:
+                    status_label.config(text="Conversion complete.")
+                    num_events = len(data.get("events", [])) if isinstance(data, dict) else 0
+                    details_label.config(
+                        text=(
+                            f"Generated {num_events} solenoid events.\n\n"
+                            "You can now send this package to the ESP32."
+                        )
+                    )
+
+                    # Store the last conversion result on the app instance
+                    # for potential future use.
+                    self.last_solenoid_package = data
+
+                close_button.config(state=tk.NORMAL)
+                self.process_button.config(state=tk.NORMAL)
+
+            self.after(0, on_complete)
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 def download_midi_file(url: str, destination: str) -> None:
