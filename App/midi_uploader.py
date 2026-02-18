@@ -4,6 +4,7 @@ from tkinter import ttk
 from pathlib import Path
 from typing import List, Dict
 import threading
+import json
 
 import requests
 from bs4 import BeautifulSoup
@@ -324,6 +325,14 @@ class MidiUploader(tk.Tk):
                     # Store the last conversion result on the app instance
                     # for potential future use.
                     self.last_solenoid_package = data
+
+                    # Print the generated JSON package to the console for inspection.
+                    try:
+                        file_stem = self.selected_file.stem if self.selected_file else "solenoid_package"
+                        print(f"--- Solenoid package for '{file_stem}' ---")
+                        print(json.dumps(data, indent=2))
+                    except Exception as e:  # pragma: no cover - printing errors
+                        print("Error printing solenoid package:", e)
 
                 close_button.config(state=tk.NORMAL)
                 self.process_button.config(state=tk.NORMAL)
