@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "SolenoidController",
+            "type": "ccs-debug",
+            "request": "launch",
+            "projectInfo": {
+                "name": "SolenoidController",
+                "resourceId": "/SolenoidController"
+            }
+        },
+        {
+            "name": "CCS Attach",
+            "type": "ccs-debug",
+            "request": "launch",
+            "targetConfig": "/Users/arnavsurjan/workspace_ccstheia/Driverlib Empty Example CCS Project/targetConfigs/TMS320F28P550SJ9.ccxml"
+        }
+    ]
+}

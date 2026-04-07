@@ -23,6 +23,15 @@ COMMON_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+MID_EXT = ".mid"
+MIDI_EXT = ".midi"
+MIDI_SUFFIXES = {MID_EXT, MIDI_EXT}
+MIDI_FILE_GLOB = f"*{MID_EXT} *{MIDI_EXT}"
+MIDI_EXTENSION_LABEL = f"{MID_EXT} or {MIDI_EXT}"
+MIDIWORLD_BASE_URL = "https://www.midiworld.com/"
+BITMIDI_BASE_URL = "https://bitmidi.com"
+HTML_PARSER = "html.parser"
+
 
 class MidiUploader(tk.Tk):
     def __init__(self) -> None:
@@ -31,9 +40,16 @@ class MidiUploader(tk.Tk):
         self.resizable(True, True)
 
         self.selected_file: Path | None = None
+        self.local_directory: Path | None = None
 
         # Selected file label
-        self.file_label = tk.Label(self, text="No MIDI file selected.", padx=20, pady=10)
+        self.file_label = tk.Label(
+            self,
+            text="No MIDI file selected.",
+            padx=20,
+            pady=10,
+            font=("TkDefaultFont", 18, "bold"),
+        )
         self.file_label.pack()
 
         # Process button (created but not shown until a MIDI file is selected)
@@ -61,9 +77,15 @@ class MidiUploader(tk.Tk):
         self.search_entry = tk.Entry(search_frame, width=40)
         self.search_entry.pack(side=tk.LEFT, padx=(0, 5), fill=tk.X, expand=True)
 
-        self.search_source = tk.StringVar(value="midiworld")
-        source_dropdown = tk.OptionMenu(search_frame, self.search_source, "midiworld", "bitmidi")
+        self.search_source = tk.StringVar(value="local")
+        source_dropdown = tk.OptionMenu(search_frame, self.search_source, "local", "midiworld", "bitmidi")
         source_dropdown.pack(side=tk.LEFT)
+
+        self.local_folder_button = tk.Button(search_frame, text="Choose Folder", command=self.choose_local_directory)
+        self.local_folder_button.pack(side=tk.LEFT, padx=(5, 0))
+
+        self.local_dir_label = tk.Label(self, text="Local folder: not selected", anchor="w")
+        self.local_dir_label.pack(padx=10, pady=(0, 5), fill=tk.X)
 
         # Clear results when switching source.
         self.search_source.trace_add("write", self._on_source_change)
@@ -98,7 +120,7 @@ class MidiUploader(tk.Tk):
     def select_file(self) -> None:
         file_path = filedialog.askopenfilename(
             title="Select a MIDI file",
-            filetypes=[("MIDI files", "*.mid *.midi")],
+            filetypes=[("MIDI files", MIDI_FILE_GLOB)],
         )
 
         if not file_path:
@@ -107,8 +129,8 @@ class MidiUploader(tk.Tk):
         path = Path(file_path)
 
         # Guard against files with the wrong extension slipping through the dialog filters.
-        if path.suffix.lower() not in {".mid", ".midi"}:
-            messagebox.showerror("Invalid File", "Please choose a file with a .mid or .midi extension.")
+        if path.suffix.lower() not in MIDI_SUFFIXES:
+            messagebox.showerror("Invalid File", f"Please choose a file with a {MIDI_EXTENSION_LABEL} extension.")
             return
 
         self.selected_file = path
@@ -119,17 +141,25 @@ class MidiUploader(tk.Tk):
         query = self.search_entry.get().strip()
         if self.search_has_placeholder or query == self.search_placeholder:
             query = ""
-        if not query:
-            messagebox.showinfo("Search", "Please enter a search term.")
-            return
 
         source = self.search_source.get()
-        if source not in {"midiworld", "bitmidi"}:
+        if source not in {"local", "midiworld", "bitmidi"}:
             messagebox.showerror("Search Error", "Invalid search source selected.")
             return
 
+        if source in {"midiworld", "bitmidi"} and not query:
+            messagebox.showinfo("Search", "Please enter a search term.")
+            return
+
         try:
-            if source == "midiworld":
+            if source == "local":
+                if self.local_directory is None:
+                    messagebox.showinfo("Local Folder", "Choose a local folder first.")
+                    self.choose_local_directory()
+                    if self.local_directory is None:
+                        return
+                search_results = search_local_midi(query, self.local_directory)
+            elif source == "midiworld":
                 search_results = search_midiworld(query)
             else:
                 search_results = search_bitmidi(query)
@@ -137,6 +167,15 @@ class MidiUploader(tk.Tk):
             messagebox.showerror("Search Error", f"Could not search {source}: {exc}")
             return
 
+        self._set_search_results(search_results)
+
+        if not self.search_results:
+            if source == "local":
+                messagebox.showinfo("No Results", "No MIDI files found in that folder for this filter.")
+            else:
+                messagebox.showinfo("No Results", "No MIDI files found for that search.")
+
+    def _set_search_results(self, search_results: List[Dict[str, str]]) -> None:
         self.results_listbox.delete(0, tk.END)
         self.search_results.clear()
 
@@ -151,9 +190,6 @@ class MidiUploader(tk.Tk):
         self.results_listbox.selection_clear(0, tk.END)
         self.download_button.config(state=tk.DISABLED)
 
-        if not self.search_results:
-            messagebox.showinfo("No Results", "No MIDI files found for that search.")
-
     def download_selected_result(self) -> None:
         if not self.search_results:
             messagebox.showinfo("Download", "Please run a search and select a result first.")
@@ -165,6 +201,17 @@ class MidiUploader(tk.Tk):
             return
 
         item = self.search_results[selection[0]]
+        local_path = item.get("local_path")
+        if local_path:
+            selected_path = Path(local_path)
+            if not selected_path.exists():
+                messagebox.showerror("Load Error", "Selected local MIDI file no longer exists.")
+                return
+            self.selected_file = selected_path
+            self.file_label.config(text=f"Selected file: {self.selected_file.name}")
+            self._show_process_button()
+            return
+
         download_url = item.get("download_url")
         if not download_url:
             messagebox.showerror("Download Error", "No download URL available for the selected item.")
@@ -175,9 +222,9 @@ class MidiUploader(tk.Tk):
         save_path = filedialog.asksaveasfilename(
             parent=self,
             title="Save MIDI file",
-            defaultextension=".mid",
+            defaultextension=MID_EXT,
             initialfile=suggested_name,
-            filetypes=[("MIDI files", "*.mid *.midi")],
+            filetypes=[("MIDI files", MIDI_FILE_GLOB)],
         )
 
         if not save_path:
@@ -235,6 +282,19 @@ class MidiUploader(tk.Tk):
     def _on_source_change(self, *args) -> None:
         """Clear results and hide results widgets when switching source."""
 
+        source = self.search_source.get()
+        if source == "local":
+            self.download_button.config(text="Load Selected")
+            self.local_folder_button.config(state=tk.NORMAL)
+        else:
+            self.download_button.config(text="Download Selected")
+            self.local_folder_button.config(state=tk.DISABLED)
+
+        # For local source, immediately show all MIDI files from the selected folder.
+        if source == "local" and self.local_directory is not None:
+            self._set_search_results(search_local_midi("", self.local_directory))
+            return
+
         self.search_results.clear()
         self.results_listbox.delete(0, tk.END)
         if self.results_visible:
@@ -242,6 +302,18 @@ class MidiUploader(tk.Tk):
             self.download_button.pack_forget()
             self.results_visible = False
         self.download_button.config(state=tk.DISABLED)
+
+    def choose_local_directory(self) -> None:
+        selected_dir = filedialog.askdirectory(parent=self, title="Select Local MIDI Folder")
+        if not selected_dir:
+            return
+
+        self.local_directory = Path(selected_dir)
+        self.local_dir_label.config(text=f"Local folder: {self.local_directory}")
+
+        # Show all MIDI files immediately when local source is active.
+        if self.search_source.get() == "local":
+            self._set_search_results(search_local_midi("", self.local_directory))
 
     def _show_results_widgets(self) -> None:
         if not self.results_visible:
@@ -315,10 +387,11 @@ class MidiUploader(tk.Tk):
                 else:
                     status_label.config(text="Conversion complete.")
                     num_events = len(data.get("events", [])) if isinstance(data, dict) else 0
+                    num_commands = len(data.get("serial_schedule", [])) if isinstance(data, dict) else 0
                     details_label.config(
                         text=(
-                            f"Generated {num_events} solenoid events.\n\n"
-                            "You can now send this package to the ESP32."
+                            f"Generated {num_events} note events and {num_commands} serial commands.\n\n"
+                            "Use midi_stream_player.py to stream commands in real time."
                         )
                     )
 
@@ -345,9 +418,9 @@ class MidiUploader(tk.Tk):
 def download_midi_file(url: str, destination: str) -> None:
     headers = dict(COMMON_HEADERS)
     if "midiworld.com" in url:
-        headers["Referer"] = "https://www.midiworld.com/"
+        headers["Referer"] = MIDIWORLD_BASE_URL
     elif "bitmidi.com" in url:
-        headers["Referer"] = "https://bitmidi.com/"
+        headers["Referer"] = f"{BITMIDI_BASE_URL}/"
 
     response = requests.get(url, stream=True, timeout=20, headers=headers)
     response.raise_for_status()
@@ -364,15 +437,15 @@ def search_midiworld(query: str) -> List[Dict[str, str]]:
     Each result is a dict with keys: title, download_url, filename.
     """
 
-    url = f"https://www.midiworld.com/search/?q={quote_plus(query)}"
+    url = f"{MIDIWORLD_BASE_URL}search/?q={quote_plus(query)}"
 
     headers = dict(COMMON_HEADERS)
-    headers["Referer"] = "https://www.midiworld.com/"
+    headers["Referer"] = MIDIWORLD_BASE_URL
 
     response = requests.get(url, timeout=20, headers=headers)
     response.raise_for_status()
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    soup = BeautifulSoup(response.text, HTML_PARSER)
     results: List[Dict[str, str]] = []
 
     for link in soup.find_all("a", href=True):
@@ -380,10 +453,10 @@ def search_midiworld(query: str) -> List[Dict[str, str]]:
         if "/download/" not in href:
             continue
 
-        download_url = urljoin("https://www.midiworld.com/", href)
+        download_url = urljoin(MIDIWORLD_BASE_URL, href)
         parent_text = link.parent.get_text(" ", strip=True) if link.parent else link.get_text(" ", strip=True)
         title = parent_text.replace("download", "").strip(" -• \u2022") or "MIDIWorld file"
-        filename = f"{title}.mid" if not title.lower().endswith((".mid", ".midi")) else title
+        filename = f"{title}{MID_EXT}" if not title.lower().endswith((MID_EXT, MIDI_EXT)) else title
 
         results.append({
             "title": title,
@@ -403,7 +476,7 @@ def search_bitmidi(query: str) -> List[Dict[str, str]]:
     may need adjustments if the site changes.
     """
 
-    base_url = "https://bitmidi.com"
+    base_url = BITMIDI_BASE_URL
     url = f"{base_url}/search?q={quote_plus(query)}"
 
     search_headers = dict(COMMON_HEADERS)
@@ -412,7 +485,7 @@ def search_bitmidi(query: str) -> List[Dict[str, str]]:
     response = requests.get(url, timeout=20, headers=search_headers)
     response.raise_for_status()
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    soup = BeautifulSoup(response.text, HTML_PARSER)
 
     track_links = []
     for link in soup.find_all("a", href=True):
@@ -432,7 +505,7 @@ def search_bitmidi(query: str) -> List[Dict[str, str]]:
         except Exception:
             continue
 
-        track_soup = BeautifulSoup(track_resp.text, "html.parser")
+        track_soup = BeautifulSoup(track_resp.text, HTML_PARSER)
         download_url = None
 
         # Prefer explicit download links that end with .mid.
@@ -445,13 +518,38 @@ def search_bitmidi(query: str) -> List[Dict[str, str]]:
         if not download_url:
             continue
 
-        filename = f"{title}.mid" if not title.lower().endswith((".mid", ".midi")) else title
+        filename = f"{title}{MID_EXT}" if not title.lower().endswith((MID_EXT, MIDI_EXT)) else title
 
         results.append({
             "title": title,
             "download_url": download_url,
             "filename": filename,
         })
+
+    return results
+
+
+def search_local_midi(query: str, directory: Path) -> List[Dict[str, str]]:
+    """Search a local directory recursively for MIDI files matching query."""
+
+    q = query.lower()
+    results: List[Dict[str, str]] = []
+
+    for path in directory.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in MIDI_SUFFIXES:
+            continue
+        if q and q not in path.stem.lower():
+            continue
+
+        results.append(
+            {
+                "title": path.name,
+                "local_path": str(path),
+                "filename": path.name,
+            }
+        )
 
     return results
 
