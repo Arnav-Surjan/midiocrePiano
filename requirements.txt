@@ -1,0 +1,11 @@
+# Inferred dependencies for solenoid piano GUI
+# Run: pip install -r requirements.txt
+
+mido
+python-rtmidi
+pyserial
+customtkinter
+python-dateutil
+
+# Optional (useful during development/testing)
+typing-extensions
