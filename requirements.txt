@@ -6,6 +6,7 @@ python-rtmidi
 pyserial
 customtkinter
 python-dateutil
+midi-visualiser>=0.1.10
 
 # Optional (useful during development/testing)
 typing-extensions

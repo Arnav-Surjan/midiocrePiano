@@ -573,22 +573,15 @@ void setup() {
 }
 
 void loop() {
-    // 1. Process incoming serial bytes
-    while (Serial.available()) {
-        uint8_t b = Serial.read();
-        serial_protocol_feed(b);
-    }
-
-    // 2. Run playback engine (queues PCA writes for any events firing now)
+    // 1. Playback FIRST so it never gets gated on parsing
     uint32_t now = micros();
     midi_player_update(now);
-
-    // 3. Update solenoid state machine (queues PCA writes for state transitions)
     solenoid_update(now);
-
-    // 4. Commit all queued PCA writes in one coalesced pass.
-    //    This is the throughput win: a chord transition that previously
-    //    required 4 separate Wire.endTransmission() calls now fires as
-    //    1–2 bursts depending on channel contiguity.
     pca9685_flush();
+
+    // 2. Bounded serial work — don't drain the whole buffer in one shot
+    int budget = 48;
+    while (Serial.available() && budget-- > 0) {
+        serial_protocol_feed(Serial.read());
+    }
 }

@@ -23,14 +23,146 @@ import struct
 import time
 import sys
 import os
+import traceback
+import importlib
+import shutil
+import tempfile
+import multiprocessing as mp
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 from tkinter import filedialog, messagebox
+from typing import Any
 
 import mido
 import serial
 import serial.tools.list_ports
+
+try:
+    pygame = importlib.import_module("pygame")
+    _visualiser_module = importlib.import_module("midi_visualiser.visualiser")
+    Visualiser = getattr(_visualiser_module, "Visualiser")
+except Exception:
+    pygame = None
+    Visualiser = None
+
+
+class _NoOpMidiOutput:
+    """Silent MIDI sink for visual-only playback."""
+
+    def send(self, _message) -> None:
+        # Intentionally no-op: visualiser should render only, never emit audio/MIDI.
+        pass
+
+    def reset(self) -> None:
+        # Intentionally no-op: there is no underlying output device to reset.
+        pass
+
+    def close(self) -> None:
+        # Intentionally no-op: there is no underlying output device to close.
+        pass
+
+
+def _visualiser_process_main(initial_midi_path: str, command_queue: Any) -> None:
+    """Owns the pygame window in a dedicated process (macOS-safe)."""
+    try:
+        pygame_local = importlib.import_module("pygame")
+        visualiser_module = importlib.import_module("midi_visualiser.visualiser")
+        visualiser_cls = getattr(visualiser_module, "Visualiser")
+
+        original_open_output = mido.open_output
+        mido.open_output = lambda *args, **kwargs: _NoOpMidiOutput()
+        try:
+            vis = visualiser_cls(initial_midi_path)
+        finally:
+            mido.open_output = original_open_output
+
+        vis.sound_output = _NoOpMidiOutput()
+        # Use a borderless window sized to the desktop resolution to
+        # emulate fullscreen-windowed (works across pygame versions).
+        info = pygame_local.display.Info()
+        desktop_size = (
+            getattr(info, "current_w", vis.display.width),
+            getattr(info, "current_h", vis.display.height),
+        )
+        vis.win = pygame_local.display.set_mode(desktop_size, pygame_local.NOFRAME)
+        if not pygame_local.font.get_init():
+            pygame_local.font.init()
+        header_font = pygame_local.font.SysFont("Menlo", 26)
+        header_text = ""
+        vis.running = True
+
+        def _wrap_header_lines(text: str, max_width: int) -> list[str]:
+            words = text.split()
+            if not words:
+                return []
+            lines: list[str] = []
+            current = words[0]
+            for word in words[1:]:
+                candidate = f"{current} {word}"
+                if header_font.size(candidate)[0] <= max_width:
+                    current = candidate
+                else:
+                    lines.append(current)
+                    current = word
+            lines.append(current)
+            return lines[:2]
+
+        while vis.running:
+            # Drain all queued control commands each frame.
+            while True:
+                try:
+                    cmd, payload = command_queue.get_nowait()
+                except Exception:
+                    break
+
+                if cmd == "quit":
+                    vis.running = False
+                elif cmd == "load":
+                    path = payload.get("path")
+                    if path:
+                        loaded = vis._load_song(path, verbose=False)
+                        if loaded is not None:
+                            if vis.song is not None:
+                                vis.song.stop()
+                            vis.song = loaded
+                            vis.song_files = [path]
+                            vis.current_song_index = 0
+                elif cmd == "start":
+                    if vis.song is not None:
+                        vis.song.reset()
+                        vis.song.start()
+                elif cmd == "pause":
+                    if vis.song is not None:
+                        vis.song.stop()
+                elif cmd == "header":
+                    header_text = payload.get("text", "")
+
+            vis._handle_events()
+            if vis.song is not None:
+                vis.song.update()
+
+            vis.display.draw(vis.win, vis.song)
+
+            if header_text:
+                max_text_width = vis.win.get_width() - 40
+                lines = _wrap_header_lines(header_text, max_text_width)
+                line_height = 34
+                panel_height = (len(lines) * line_height) + 20
+                panel = pygame_local.Surface((vis.win.get_width(), panel_height),
+                                             pygame_local.SRCALPHA)
+                panel.fill((0, 0, 0, 170))
+                vis.win.blit(panel, (0, 0))
+                for idx, line in enumerate(lines):
+                    txt = header_font.render(line, True, (255, 255, 255))
+                    vis.win.blit(txt, (20, 10 + idx * line_height))
+
+            pygame_local.display.update()
+            vis.clock.tick(60)
+
+        vis._cleanup()
+    except Exception:
+        traceback.print_exc()
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +204,7 @@ INTER_BATCH_DELAY_S = 0.005     # small breather between batches
 POST_OPEN_SETTLE_S  = 2.0       # UNO R4 resets on port open
 ACK_TIMEOUT_S       = 2.0
 BACKPRESSURE_POLL_S = 0.010     # wait between PINGs when ring is full
+VISUALISER_START_LEAD_S = 2.000 # start visualiser slightly before CMD_START
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F',
               'F#', 'G', 'G#', 'A', 'A#', 'B']
@@ -746,7 +879,7 @@ class SolenoidPianoApp(ctk.CTk):
         self.is_scanning_folder = False
         self.folder_view_mode = "grid"
         self.current_folder_path: Path | None = None
-        self.folder_songs_with_meta: list[tuple[Path, SongData | None]] = []
+        self.folder_refresh_request_id = 0
         self.selected_folder_song: SongData | None = None
         self.selected_folder_song_path: Path | None = None
         self.folder_item_widgets: dict[Path, list[ctk.CTkBaseClass]] = {}
@@ -754,8 +887,22 @@ class SolenoidPianoApp(ctk.CTk):
         self.folder_selected_color = "#F4B06A"
         self.folder_sort_field = "Filename"
         self.folder_sort_order = "A-Z"
+        self.song_source_path: Path | None = None
+
+        # MIDI visualiser state
+        self.visualiser_process: Any | None = None
+        self.visualiser_queue: Any | None = None
+        self.visualiser_loaded_path: Path | None = None
+        self.visualiser_filename = ""
+        self.visualiser_composer = ""
+        self.visualiser_duration_sec = 0.0
+        self.visualiser_start_monotonic: float | None = None
+        self.visualiser_paused_progress_sec = 0.0
+        self.visualiser_header_job = None
+        self.visualiser_temp_dir = tempfile.TemporaryDirectory(prefix="midi_vis_")
 
         self._build_ui()
+        self._open_visualiser_on_startup()
 
     # -----------------------------------------------------------------------
     # UI construction
@@ -781,6 +928,12 @@ class SolenoidPianoApp(ctk.CTk):
 
         self.player_tab = self.tabview.add("Single Song")
         self.folder_tab = self.tabview.add("Folder View")
+
+        # Trigger folder re-parse whenever Folder View is entered.
+        try:
+            self.tabview.configure(command=self._on_tab_changed)
+        except Exception:
+            pass
 
         self._build_single_song_tab(self.player_tab)
         self._build_folder_tab(self.folder_tab)
@@ -1235,15 +1388,9 @@ class SolenoidPianoApp(ctk.CTk):
             text_color="black",
         )
 
-        self.is_scanning_folder = True
-        self.folder_browse_btn.configure(state="disabled")
-        threading.Thread(
-            target=self._scan_folder_worker,
-            args=(folder_path,),
-            daemon=True,
-        ).start()
+        self._request_folder_reparse(folder_path)
 
-    def _scan_folder_worker(self, folder_path: Path):
+    def _parse_folder_songs(self, folder_path: Path) -> list[tuple[Path, SongData | None]]:
         midi_files = sorted(
             [p for p in folder_path.iterdir() if p.is_file() and p.suffix.lower() in {".mid", ".midi"}],
             key=lambda p: p.name.lower(),
@@ -1257,15 +1404,36 @@ class SolenoidPianoApp(ctk.CTk):
                 song = None
             songs_with_meta.append((midi_file, song))
 
-        self.after(0, self._on_folder_scan_complete, folder_path, songs_with_meta)
+        return songs_with_meta
 
-    def _on_folder_scan_complete(self, folder_path: Path,
-                                 songs_with_meta: list[tuple[Path, SongData | None]]):
+    def _request_folder_reparse(self, folder_path: Path):
         self.current_folder_path = folder_path
-        self.folder_songs_with_meta = songs_with_meta
+        self.is_scanning_folder = True
+        self.folder_browse_btn.configure(state="disabled")
+        self.folder_refresh_request_id += 1
+        request_id = self.folder_refresh_request_id
+
+        threading.Thread(
+            target=self._folder_reparse_worker,
+            args=(folder_path, request_id),
+            daemon=True,
+        ).start()
+
+    def _folder_reparse_worker(self, folder_path: Path, request_id: int):
+        songs_with_meta = self._parse_folder_songs(folder_path)
+        self.after(0, self._on_folder_reparse_complete,
+                   folder_path, songs_with_meta, request_id)
+
+    def _on_folder_reparse_complete(self, folder_path: Path,
+                                    songs_with_meta: list[tuple[Path, SongData | None]],
+                                    request_id: int):
+        if request_id != self.folder_refresh_request_id:
+            return
+
+        self.current_folder_path = folder_path
         self.is_scanning_folder = False
         self.folder_browse_btn.configure(state="normal")
-        self._render_folder_files()
+        self._render_folder_files(songs_with_meta)
 
     def _clear_folder_view_widgets(self):
         for tile in self.song_tiles:
@@ -1346,6 +1514,11 @@ class SolenoidPianoApp(ctk.CTk):
             messagebox.showwarning("No Song Selected", "Select a parsed song first.")
             return
 
+        if self.selected_folder_song_path is None:
+            messagebox.showwarning("No Source File",
+                                   "Please re-select the song before transmitting.")
+            return
+
         port_str = self.folder_port_combo.get()
         if "No ports" in port_str or "click refresh" in port_str:
             messagebox.showwarning("No Port",
@@ -1366,10 +1539,14 @@ class SolenoidPianoApp(ctk.CTk):
         self.folder_browse_btn.configure(state="disabled")
         self.folder_progress.set(0)
 
-        threading.Thread(target=self._transmit_worker_folder,
-                         args=(port, baud, song), daemon=True).start()
+        self._open_visualiser_window(self.selected_folder_song_path, song)
 
-    def _transmit_worker_folder(self, port: str, baud: int, song: SongData):
+        threading.Thread(target=self._transmit_worker_folder,
+                         args=(port, baud, song, self.selected_folder_song_path),
+                         daemon=True).start()
+
+    def _transmit_worker_folder(self, port: str, baud: int,
+                                song: SongData, song_path: Path):
         ser: serial.Serial | None = None
         try:
             self._set_folder_status_safe(f"Connecting to {port}...")
@@ -1431,8 +1608,13 @@ class SolenoidPianoApp(ctk.CTk):
                 self._update_folder_progress_safe(sent / total)
 
                 if not started and (sent >= BATCH_SIZE * PRIME_BATCHES or sent >= total):
+                    # Start the visualiser immediately before START so it stays
+                    # aligned with when the MCU begins playback.
+                    self._start_visualiser_playback(song, song_path)
+                    time.sleep(VISUALISER_START_LEAD_S)
                     send_packet(ser, build_command_packet(CMD_START))
                     if wait_for_ack(ser) is None:
+                        self._pause_visualiser_playback()
                         self._show_error_safe("Playback Error", "No ACK for START.")
                         return
                     started = True
@@ -1448,8 +1630,13 @@ class SolenoidPianoApp(ctk.CTk):
             wait_for_ack(ser)
 
             if not started:
+                self._start_visualiser_playback(song, song_path)
+                time.sleep(VISUALISER_START_LEAD_S)
                 send_packet(ser, build_command_packet(CMD_START))
-                wait_for_ack(ser)
+                if wait_for_ack(ser) is None:
+                    self._pause_visualiser_playback()
+                    self._show_error_safe("Playback Error", "No ACK for START.")
+                    return
 
             self._update_folder_progress_safe(1.0)
             self._set_folder_status_safe(
@@ -1469,6 +1656,7 @@ class SolenoidPianoApp(ctk.CTk):
 
     def _send_folder_stop(self):
         self.is_transmitting = False
+        self._pause_visualiser_playback()
         ser: serial.Serial | None = None
         try:
             port = extract_port_name(self.folder_port_combo.get())
@@ -1490,14 +1678,34 @@ class SolenoidPianoApp(ctk.CTk):
             return
         self.folder_view_mode = mode
         self._update_folder_view_buttons()
-        if self.current_folder_path is not None:
-            self._render_folder_files()
+        if self.current_folder_path is not None and not self.is_scanning_folder:
+            self.folder_summary_label.configure(
+                text="Refreshing MIDI files...",
+                text_color="black",
+            )
+            self._request_folder_reparse(self.current_folder_path)
 
     def _on_folder_sort_changed(self, _value: str):
         self.folder_sort_field = self.sort_field_combo.get()
         self.folder_sort_order = self.sort_order_combo.get()
-        if self.current_folder_path is not None:
-            self._render_folder_files()
+        if self.current_folder_path is not None and not self.is_scanning_folder:
+            self.folder_summary_label.configure(
+                text="Refreshing MIDI files...",
+                text_color="black",
+            )
+            self._request_folder_reparse(self.current_folder_path)
+
+    def _on_tab_changed(self, *_args):
+        if self.tabview.get() != "Folder View":
+            return
+        if self.current_folder_path is None or self.is_scanning_folder:
+            return
+
+        self.folder_summary_label.configure(
+            text="Refreshing MIDI files...",
+            text_color="black",
+        )
+        self._request_folder_reparse(self.current_folder_path)
 
     def _get_sorted_folder_songs(self,
                                  songs_with_meta: list[tuple[Path, SongData | None]]
@@ -1541,9 +1749,8 @@ class SolenoidPianoApp(ctk.CTk):
                 text_color="black",
             )
 
-    def _render_folder_files(self):
+    def _render_folder_files(self, songs_with_meta: list[tuple[Path, SongData | None]]):
         folder_path = self.current_folder_path
-        songs_with_meta = self.folder_songs_with_meta
 
         if folder_path is None:
             return
@@ -1572,8 +1779,28 @@ class SolenoidPianoApp(ctk.CTk):
             self._populate_song_grid(self._get_sorted_folder_songs(songs_with_meta))
 
         if self.selected_folder_song_path and self.selected_folder_song_path in self.folder_item_widgets:
+            selected_song = None
+            for midi_file, song in songs_with_meta:
+                if midi_file == self.selected_folder_song_path:
+                    selected_song = song
+                    break
+            self.selected_folder_song = selected_song
+
             for widget in self.folder_item_widgets[self.selected_folder_song_path]:
                 widget.configure(fg_color=self.folder_selected_color)
+
+            if selected_song is None:
+                self.folder_overlay_song_label.configure(
+                    text=f"Selected: {self.selected_folder_song_path.name} (parse failed)")
+                self.folder_overlay_status.configure(
+                    text="This file could not be parsed. Re-select another song.")
+                self.folder_transmit_btn.configure(state="disabled")
+            else:
+                self.folder_overlay_song_label.configure(text=f"Selected: {selected_song.filename}")
+                self.folder_overlay_status.configure(
+                    text=f"Ready to transmit {selected_song.filename}")
+                self.folder_transmit_btn.configure(state="normal")
+
             self._set_folder_overlay_visible(True)
         else:
             self._clear_folder_selection()
@@ -1792,6 +2019,7 @@ class SolenoidPianoApp(ctk.CTk):
             self._set_status("Error parsing file.")
             return
 
+        self.song_source_path = Path(path)
         self.file_label.configure(text=Path(path).name, text_color=ACCENT, font=ctk.CTkFont(size=13, weight="bold"))
         self._update_song_info()
         self._populate_event_list()
@@ -1860,6 +2088,11 @@ class SolenoidPianoApp(ctk.CTk):
             messagebox.showwarning("No Data", "Load a MIDI file first.")
             return
 
+        if self.song_source_path is None:
+            messagebox.showwarning("No Source File",
+                                   "Please re-load the MIDI file before transmitting.")
+            return
+
         port_str = self.port_combo.get()
         if "No ports" in port_str or "click refresh" in port_str:
             messagebox.showwarning("No Port",
@@ -1875,6 +2108,8 @@ class SolenoidPianoApp(ctk.CTk):
         self.browse_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress.set(0)
+
+        self._open_visualiser_window(self.song_source_path, self.song)
 
         threading.Thread(target=self._transmit_worker,
                          args=(port, baud), daemon=True).start()
@@ -1976,8 +2211,13 @@ class SolenoidPianoApp(ctk.CTk):
                 # throughput has to keep up with real time.
                 if not started and (sent >= BATCH_SIZE * PRIME_BATCHES or
                                     sent >= total):
+                    # Start the visualiser immediately before START so it stays
+                    # aligned with when the MCU begins playback.
+                    self._start_visualiser_playback()
+                    time.sleep(VISUALISER_START_LEAD_S)
                     send_packet(ser, build_command_packet(CMD_START))
                     if wait_for_ack(ser) is None:
+                        self._pause_visualiser_playback()
                         self._show_error_safe("Playback Error",
                                               "No ACK for START.")
                         return
@@ -2001,8 +2241,14 @@ class SolenoidPianoApp(ctk.CTk):
             # Edge case: very short song never met the prime threshold
             # (e.g. <2 batches total), so we never sent START.
             if not started:
+                self._start_visualiser_playback()
+                time.sleep(VISUALISER_START_LEAD_S)
                 send_packet(ser, build_command_packet(CMD_START))
-                wait_for_ack(ser)
+                if wait_for_ack(ser) is None:
+                    self._pause_visualiser_playback()
+                    self._show_error_safe("Playback Error",
+                                          "No ACK for START.")
+                    return
 
             self._update_progress_safe(1.0)
             self._set_status_safe(
@@ -2116,6 +2362,7 @@ class SolenoidPianoApp(ctk.CTk):
 
     def _send_stop(self):
         self.is_transmitting = False
+        self._pause_visualiser_playback()
         ser: serial.Serial | None = None
         try:
             port = extract_port_name(self.port_combo.get())
@@ -2145,6 +2392,9 @@ class SolenoidPianoApp(ctk.CTk):
     def _show_error_safe(self, title: str, message: str):
         self.after(0, messagebox.showerror, title, message)
 
+    def _show_warning_safe(self, title: str, message: str):
+        self.after(0, messagebox.showwarning, title, message)
+
     def _set_folder_status_safe(self, text: str):
         self.after(0, self.folder_overlay_status.configure, {"text": text})
 
@@ -2167,6 +2417,188 @@ class SolenoidPianoApp(ctk.CTk):
             self.browse_btn.configure(state="normal")
             self.stop_btn.configure(state="disabled")
         self.after(0, _finish)
+
+    # -----------------------------------------------------------------------
+    # MIDI visualiser integration
+    # -----------------------------------------------------------------------
+
+    def _create_visualiser_bootstrap_song(self) -> Path:
+        """Create a tiny .mid file so the visualiser can open at app startup."""
+        bootstrap_path = Path(self.visualiser_temp_dir.name) / "_bootstrap_visualiser.mid"
+        if bootstrap_path.exists():
+            return bootstrap_path
+
+        mid = mido.MidiFile()
+        track = mido.MidiTrack()
+        mid.tracks.append(track)
+        track.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
+        track.append(mido.Message("note_on", note=60, velocity=1, time=0))
+        track.append(mido.Message("note_off", note=60, velocity=0, time=1))
+        mid.save(bootstrap_path)
+        return bootstrap_path
+
+    def _open_visualiser_on_startup(self) -> None:
+        """Open the visualiser window alongside the GUI before any song upload."""
+        if Visualiser is None or self._visualiser_alive():
+            return
+
+        try:
+            bootstrap_path = self._create_visualiser_bootstrap_song()
+            self._open_visualiser_window(bootstrap_path, SongData(filename="Waiting for Upload"))
+            self.visualiser_filename = "Waiting for Upload"
+            self.visualiser_composer = "--"
+            self.visualiser_duration_sec = 0.0
+            self.visualiser_paused_progress_sec = 0.0
+            self.visualiser_start_monotonic = None
+            self._update_visualiser_header(0.0)
+        except Exception:
+            # Startup visualiser is best-effort; playback flow will retry as needed.
+            traceback.print_exc()
+
+    def _visualiser_alive(self) -> bool:
+        return self.visualiser_process is not None and self.visualiser_process.is_alive()
+
+    def _send_visualiser_command(self, cmd: str, **payload: Any) -> None:
+        if not self._visualiser_alive() or self.visualiser_queue is None:
+            return
+        try:
+            self.visualiser_queue.put((cmd, payload))
+        except Exception:
+            pass
+
+    def _prepare_visualiser_path(self, midi_path: Path) -> Path:
+        """
+        midi-visualiser currently accepts only .mid input files.
+        If the source song is .midi, create a temporary .mid copy.
+        """
+        suffix = midi_path.suffix.lower()
+        if suffix == ".mid":
+            return midi_path
+
+        if suffix != ".midi":
+            return midi_path
+
+        safe_stem = midi_path.stem.replace(" ", "_")
+        temp_target = Path(self.visualiser_temp_dir.name) / (
+            f"{safe_stem}_{int(time.time() * 1000)}.mid"
+        )
+        shutil.copy2(midi_path, temp_target)
+        return temp_target
+
+    def _open_visualiser_window(self, midi_path: Path, song: SongData) -> None:
+        if Visualiser is None:
+            self._show_warning_safe(
+                "MIDI Visualiser Not Installed",
+                "Install dependencies from requirements.txt to enable synced visualisation.")
+            return
+
+        source_path = midi_path.resolve()
+        midi_path = self._prepare_visualiser_path(source_path)
+        self.visualiser_filename = song.filename
+        self.visualiser_composer = parse_composer_from_filename(source_path) or "Unknown"
+        self.visualiser_duration_sec = song.duration_sec
+        self.visualiser_paused_progress_sec = 0.0
+        self.visualiser_start_monotonic = None
+
+        if self._visualiser_alive():
+            self._load_visualiser_song(midi_path)
+            self._update_visualiser_header(0.0)
+            self._ensure_visualiser_header_loop()
+            return
+
+        self.visualiser_queue = mp.Queue()
+        self.visualiser_process = mp.Process(
+            target=_visualiser_process_main,
+            args=(str(midi_path), self.visualiser_queue),
+            daemon=True,
+        )
+        self.visualiser_process.start()
+        self.visualiser_loaded_path = midi_path
+        self._update_visualiser_header(0.0)
+        self._ensure_visualiser_header_loop()
+
+    def _load_visualiser_song(self, midi_path: Path) -> None:
+        if not self._visualiser_alive():
+            return
+
+        already_loaded = self.visualiser_loaded_path == midi_path
+        if already_loaded:
+            return
+
+        self._send_visualiser_command("load", path=str(midi_path))
+        self.visualiser_loaded_path = midi_path
+
+    def _start_visualiser_playback(self, song: SongData | None = None,
+                                   song_path: Path | None = None) -> None:
+        if Visualiser is None:
+            return
+
+        if song is None:
+            song = self.song
+        if song is None:
+            return
+
+        if song_path is None:
+            song_path = self.song_source_path
+        if song_path is None:
+            return
+
+        self._open_visualiser_window(song_path, song)
+        self.visualiser_start_monotonic = time.monotonic()
+        self.visualiser_paused_progress_sec = 0.0
+
+        self._send_visualiser_command("start")
+
+        self._update_visualiser_header(0.0)
+        self._ensure_visualiser_header_loop()
+
+    def _pause_visualiser_playback(self) -> None:
+        if Visualiser is None:
+            return
+
+        progress = self._get_visualiser_progress_sec()
+        self.visualiser_paused_progress_sec = progress
+        self.visualiser_start_monotonic = None
+
+        self._send_visualiser_command("pause")
+
+        self._update_visualiser_header(progress)
+
+    def _get_visualiser_progress_sec(self) -> float:
+        if self.visualiser_start_monotonic is None:
+            return min(self.visualiser_paused_progress_sec, self.visualiser_duration_sec)
+
+        elapsed = max(0.0, time.monotonic() - self.visualiser_start_monotonic)
+        return min(elapsed, self.visualiser_duration_sec)
+
+    def _update_visualiser_header(self, progress_sec: float | None = None) -> None:
+        if not self._visualiser_alive():
+            return
+
+        if progress_sec is None:
+            progress_sec = self._get_visualiser_progress_sec()
+
+        header = (
+            f"Filename: {self.visualiser_filename} | "
+            f"Composer: {self.visualiser_composer} | "
+            f"Song Duration: {self.visualiser_duration_sec:.1f}s | "
+            f"Current Song Progress: {progress_sec:.1f}s"
+        )
+        self._send_visualiser_command("header", text=header)
+
+    def _ensure_visualiser_header_loop(self) -> None:
+        if self.visualiser_header_job is not None:
+            return
+
+        def _tick() -> None:
+            self.visualiser_header_job = None
+            if not self._visualiser_alive():
+                return
+
+            self._update_visualiser_header()
+            self.visualiser_header_job = self.after(200, _tick)
+
+        self.visualiser_header_job = self.after(200, _tick)
 
 
 # ---------------------------------------------------------------------------
