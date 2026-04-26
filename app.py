@@ -4,165 +4,30 @@ Solenoid Piano Controller
 Desktop GUI for parsing MIDI files and transmitting to
 the Arduino UNO R4 Minima solenoid piano controller.
 
-STREAMING MODE: Events are fed to the Arduino's ring buffer continuously
-during playback, so song length is no longer capped by MCU RAM. The
-Arduino's ACK carries its current free-slot count, which this uploader
-uses to throttle and avoid overruns. When all events have been sent,
-a CMD_EOS tells the firmware it can end playback once the ring drains.
+(Original docstring preserved — see header in your repo.)
 
-Dependencies:
-    pip install mido python-rtmidi pyserial customtkinter
-
-Launch:
-    python solenoid_piano_app.py
+Adds a synthesia-style visualizer window that opens alongside the main
+controller window. Falling notes are synced to the firmware playback
+clock so what you see hitting the keyboard line is exactly what the
+solenoids are firing.
 """
 
+import bisect
 import customtkinter as ctk
+import tkinter as tk
 import threading
 import struct
 import time
 import sys
 import os
-import traceback
-import importlib
-import shutil
-import tempfile
-import multiprocessing as mp
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 from tkinter import filedialog, messagebox
-from typing import Any
 
 import mido
 import serial
 import serial.tools.list_ports
-
-try:
-    pygame = importlib.import_module("pygame")
-    _visualiser_module = importlib.import_module("midi_visualiser.visualiser")
-    Visualiser = getattr(_visualiser_module, "Visualiser")
-except Exception:
-    pygame = None
-    Visualiser = None
-
-
-class _NoOpMidiOutput:
-    """Silent MIDI sink for visual-only playback."""
-
-    def send(self, _message) -> None:
-        # Intentionally no-op: visualiser should render only, never emit audio/MIDI.
-        pass
-
-    def reset(self) -> None:
-        # Intentionally no-op: there is no underlying output device to reset.
-        pass
-
-    def close(self) -> None:
-        # Intentionally no-op: there is no underlying output device to close.
-        pass
-
-
-def _visualiser_process_main(initial_midi_path: str, command_queue: Any) -> None:
-    """Owns the pygame window in a dedicated process (macOS-safe)."""
-    try:
-        pygame_local = importlib.import_module("pygame")
-        visualiser_module = importlib.import_module("midi_visualiser.visualiser")
-        visualiser_cls = getattr(visualiser_module, "Visualiser")
-
-        original_open_output = mido.open_output
-        mido.open_output = lambda *args, **kwargs: _NoOpMidiOutput()
-        try:
-            vis = visualiser_cls(initial_midi_path)
-        finally:
-            mido.open_output = original_open_output
-
-        vis.sound_output = _NoOpMidiOutput()
-        # Use a borderless window sized to the desktop resolution to
-        # emulate fullscreen-windowed (works across pygame versions).
-        info = pygame_local.display.Info()
-        desktop_size = (
-            getattr(info, "current_w", vis.display.width),
-            getattr(info, "current_h", vis.display.height),
-        )
-        vis.win = pygame_local.display.set_mode(desktop_size, pygame_local.NOFRAME)
-        if not pygame_local.font.get_init():
-            pygame_local.font.init()
-        header_font = pygame_local.font.SysFont("Menlo", 26)
-        header_text = ""
-        vis.running = True
-
-        def _wrap_header_lines(text: str, max_width: int) -> list[str]:
-            words = text.split()
-            if not words:
-                return []
-            lines: list[str] = []
-            current = words[0]
-            for word in words[1:]:
-                candidate = f"{current} {word}"
-                if header_font.size(candidate)[0] <= max_width:
-                    current = candidate
-                else:
-                    lines.append(current)
-                    current = word
-            lines.append(current)
-            return lines[:2]
-
-        while vis.running:
-            # Drain all queued control commands each frame.
-            while True:
-                try:
-                    cmd, payload = command_queue.get_nowait()
-                except Exception:
-                    break
-
-                if cmd == "quit":
-                    vis.running = False
-                elif cmd == "load":
-                    path = payload.get("path")
-                    if path:
-                        loaded = vis._load_song(path, verbose=False)
-                        if loaded is not None:
-                            if vis.song is not None:
-                                vis.song.stop()
-                            vis.song = loaded
-                            vis.song_files = [path]
-                            vis.current_song_index = 0
-                elif cmd == "start":
-                    if vis.song is not None:
-                        vis.song.reset()
-                        vis.song.start()
-                elif cmd == "pause":
-                    if vis.song is not None:
-                        vis.song.stop()
-                elif cmd == "header":
-                    header_text = payload.get("text", "")
-
-            vis._handle_events()
-            if vis.song is not None:
-                vis.song.update()
-
-            vis.display.draw(vis.win, vis.song)
-
-            if header_text:
-                max_text_width = vis.win.get_width() - 40
-                lines = _wrap_header_lines(header_text, max_text_width)
-                line_height = 34
-                panel_height = (len(lines) * line_height) + 20
-                panel = pygame_local.Surface((vis.win.get_width(), panel_height),
-                                             pygame_local.SRCALPHA)
-                panel.fill((0, 0, 0, 170))
-                vis.win.blit(panel, (0, 0))
-                for idx, line in enumerate(lines):
-                    txt = header_font.render(line, True, (255, 255, 255))
-                    vis.win.blit(txt, (20, 10 + idx * line_height))
-
-            pygame_local.display.update()
-            vis.clock.tick(60)
-
-        vis._cleanup()
-    except Exception:
-        traceback.print_exc()
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +36,7 @@ def _visualiser_process_main(initial_midi_path: str, command_queue: Any) -> None
 
 MIDI_NOTE_LOW  = 21
 MIDI_NOTE_HIGH = 108
-NUM_KEYS = 74  
+NUM_KEYS = 74
 
 PACKET_HEADER   = 0xAA
 PACKET_FOOTER   = 0x55
@@ -179,40 +44,70 @@ CMD_EVENT_BATCH = 0x01
 CMD_START       = 0x02
 CMD_STOP        = 0x03
 CMD_PING        = 0x04
-CMD_EOS         = 0x05     # "no more events coming"
+CMD_EOS         = 0x05
 CMD_ACK         = 0x10
 
 BATCH_SIZE = 64
 
-# Must match RING_CAPACITY in the firmware. Used only as an initial
-# optimistic estimate before the first ACK arrives with the real value.
 RING_CAPACITY = 1024
-
-# How many batches to prime the ring with before issuing CMD_START.
-# Two full batches (~128 events) gives the playback engine a comfortable
-# head start before serial throughput has to keep up with real time.
 PRIME_BATCHES = 2
 
-# Timing-cleanup constants
-RESTRIKE_WINDOW_US  = 100_000   # 100 ms  – merge fast OFF→ON restrikes
-DUPLICATE_ON_US     = 210_000   # 210 ms  – remove duplicate ONs per channel
-MIN_GAP_US          = 15_000   # 100 ms  – minimum time between event groups
-CHORD_WINDOW_US     = 1_000     # 2 ms    – events within this window = chord
+RESTRIKE_WINDOW_US  = 100_000
+DUPLICATE_ON_US     = 210_000
+MIN_GAP_US          = 15_000
+CHORD_WINDOW_US     = 1_000
 
-# Serial-transport timing
-INTER_BATCH_DELAY_S = 0.005     # small breather between batches
-POST_OPEN_SETTLE_S  = 2.0       # UNO R4 resets on port open
+INTER_BATCH_DELAY_S = 0.005
+POST_OPEN_SETTLE_S  = 2.0
 ACK_TIMEOUT_S       = 2.0
-BACKPRESSURE_POLL_S = 0.010     # wait between PINGs when ring is full
-VISUALISER_START_LEAD_S = 2.000 # start visualiser slightly before CMD_START
+BACKPRESSURE_POLL_S = 0.010
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F',
               'F#', 'G', 'G#', 'A', 'A#', 'B']
 
 ACCENT       = "#BF5700"
 ACCENT_HOVER = "#C48654"
-SECTION_BG = "#FFE6C8"   
-WINDOW_BG = "#FFF7EE"
+SECTION_BG   = "#FFE6C8"
+WINDOW_BG    = "#FFF7EE"
+
+# --- Visualizer constants -------------------------------------------------
+# Full piano = MIDI 21..108 (A0..C8) = 88 keys. The solenoid rig only
+# covers NUM_KEYS of those (channel 0 == MIDI_NOTE_LOW), but we still
+# draw the full 88-key keyboard like in the reference screenshots.
+VIS_FIRST_MIDI = 21
+VIS_LAST_MIDI  = 108
+VIS_NUM_WHITE  = 52   # white keys in 88-key piano
+VIS_FALL_PX_PER_SEC = 220     # how fast notes fall
+VIS_LOOKAHEAD_S     = 4.0     # how far ahead of the playhead to draw
+VIS_FRAME_INTERVAL_MS = 33    # ~30 FPS
+
+VIS_BG          = "#FFE6C8"
+VIS_HEADER_BG   = "#BF5700"
+VIS_HEADER_FG   = "#ffffff"
+VIS_GUIDELINE   = "#F8971F"
+VIS_PLAYLINE    = "#BF5700"
+# Note colors: bright body + darker outline/tail like the reference
+VIS_NOTE_GREEN_BODY    = "#F8971F"
+VIS_NOTE_GREEN_OUTLINE = "#BF5700"
+# When a note is "active" (currently sounding), use a slightly different
+# look so the bar visually anchors to the key.
+VIS_KEY_ACTIVE  = "#F8971F"
+VIS_WHITE_KEY   = "#ffffff"
+VIS_BLACK_KEY   = "#000000"
+VIS_KEY_BORDER  = "#000000"
+
+# --- Header marquee constants --------------------------------------------
+# Filename gets a fixed-percentage region on the left; if the filename is
+# longer than that region, it scrolls marquee-style (left to right) with
+# a "tail" gap so the loop is seamless. The right side (Song Duration /
+# Current Song Progress) is anchored to the right edge and never moves.
+VIS_HEADER_FILENAME_FRAC = 0.55   # filename region = 55% of header width
+VIS_HEADER_PAD_X         = 31     # left/right padding inside the header
+VIS_HEADER_PAD_Y         = 27     # top/bottom padding inside the header
+VIS_HEADER_FONT          = ("Consolas", 26, "bold")
+VIS_MARQUEE_PX_PER_SEC   = 60     # scroll speed
+VIS_MARQUEE_TAIL_PX      = 80     # gap between filename copies in loop
+
 
 class EventType(IntEnum):
     NOTE_ON  = 1
@@ -256,6 +151,9 @@ class SongData:
     events: list[SolenoidEvent] = field(default_factory=list)
     duration_us: int = 0
     tempo_bpm: float = 120.0
+    # Pre-paired (start_us, end_us, channel) triples for the visualizer.
+    # Computed once after the timing-cleanup pipeline runs.
+    note_segments: list[tuple[int, int, int]] = field(default_factory=list)
 
     @property
     def num_events(self) -> int:
@@ -290,8 +188,59 @@ def parse_composer_from_filename(filepath: Path) -> str:
     return composer
 
 
+def is_black_key(midi_note: int) -> bool:
+    return (midi_note % 12) in (1, 3, 6, 8, 10)
+
+
+def strip_midi_extension(filename: str) -> str:
+    """
+    Strip a trailing .mid / .midi extension (case-insensitive) for display.
+    Examples:
+        "Fur Elise - Beethoven.mid"   -> "Fur Elise - Beethoven"
+        "Angry Birds Theme.MIDI"      -> "Angry Birds Theme"
+        "no_extension_song"           -> "no_extension_song"
+    """
+    if filename.lower().endswith(".midi"):
+        return filename[:-5]
+    if filename.lower().endswith(".mid"):
+        return filename[:-4]
+    return filename
+
+
+def build_note_segments(events: list[SolenoidEvent]
+                        ) -> list[tuple[int, int, int]]:
+    """
+    Pair NOTE_ON with the next NOTE_OFF on the same channel.
+    Returns list of (start_us, end_us, channel) triples.
+    Unmatched ONs are extended to start_us + 200ms as a sane default.
+    """
+    open_notes: dict[int, int] = {}   # channel -> on_time
+    segments: list[tuple[int, int, int]] = []
+
+    for ev in events:
+        if ev.event_type == EventType.NOTE_ON:
+            # If we somehow have an unmatched ON already, close it at this
+            # new ON (synthesia-style — repeat means previous segment ends).
+            prev = open_notes.get(ev.channel)
+            if prev is not None:
+                segments.append((prev, ev.timestamp_us, ev.channel))
+            open_notes[ev.channel] = ev.timestamp_us
+        else:
+            start = open_notes.pop(ev.channel, None)
+            if start is not None:
+                end = max(ev.timestamp_us, start + 30_000)  # min 30ms
+                segments.append((start, end, ev.channel))
+
+    # Any unmatched ONs left over
+    for ch, start in open_notes.items():
+        segments.append((start, start + 200_000, ch))
+
+    segments.sort(key=lambda s: s[0])
+    return segments
+
+
 # ---------------------------------------------------------------------------
-# Timing / event-cleanup pipeline
+# Timing / event-cleanup pipeline (unchanged)
 # ---------------------------------------------------------------------------
 
 def merge_fast_restrikes(
@@ -300,16 +249,6 @@ def merge_fast_restrikes(
     firmware_restrike_delay_us: int = 110_000,
     min_on_gap_us: int = 100_000,
 ) -> list[SolenoidEvent]:
-    """
-    If a NOTE_OFF is followed by a NOTE_ON on the same channel within
-    restrike_window_us, remove the OFF and shift that next ON earlier by
-    firmware_restrike_delay_us.
-
-    Then re-check ON-to-ON spacing on the same channel:
-      - if shifted ON is at least min_on_gap_us after previous ON, keep it
-      - otherwise delete the shifted ON
-    """
-
     merged: list[SolenoidEvent] = []
     n = len(events)
     skip_indices: set[int] = set()
@@ -326,52 +265,42 @@ def merge_fast_restrikes(
 
         for j in range(i + 1, n):
             nxt = events[j]
-
             if nxt.channel != ev.channel:
                 continue
 
             gap = nxt.timestamp_us - ev.timestamp_us
-
             if gap > restrike_window_us:
                 break
 
             if nxt.event_type == EventType.NOTE_ON:
                 new_time = max(0, nxt.timestamp_us - firmware_restrike_delay_us)
-
                 shifted_on = SolenoidEvent(
                     timestamp_us=new_time,
                     channel=nxt.channel,
                     event_type=nxt.event_type,
                     velocity=nxt.velocity,
                 )
-
                 merged.append(shifted_on)
                 skip_indices.add(j)
                 remove_off = True
-
             break
 
         if not remove_off:
             merged.append(ev)
 
-    # Re-sort because shifting ONs backward can put events out of order
     merged.sort(key=lambda e: e.timestamp_us)
 
-    # Remove ONs that are too close to the previous ON on the same channel
     final: list[SolenoidEvent] = []
     last_on_time_by_channel: dict[int, int] = {}
 
     for ev in merged:
         if ev.event_type == EventType.NOTE_ON:
             last_on = last_on_time_by_channel.get(ev.channel)
-
             if last_on is not None:
                 gap = ev.timestamp_us - last_on
                 if gap < min_on_gap_us:
                     continue
-
             last_on_time_by_channel[ev.channel] = ev.timestamp_us
-
         final.append(ev)
 
     return final
@@ -380,10 +309,6 @@ def merge_fast_restrikes(
 def remove_fast_duplicate_ons(events: list[SolenoidEvent],
                                window_us: int = DUPLICATE_ON_US
                                ) -> list[SolenoidEvent]:
-    """
-    Drop a NOTE_ON if the previous NOTE_ON for the same channel occurred
-    within window_us (avoids hammering the solenoid faster than it can reset).
-    """
     result: list[SolenoidEvent] = []
     last_on_time: dict[int, int] = {}
 
@@ -391,11 +316,11 @@ def remove_fast_duplicate_ons(events: list[SolenoidEvent],
         if ev.event_type == EventType.NOTE_ON:
             last_time = last_on_time.get(ev.channel)
             if last_time is not None and (ev.timestamp_us - last_time) < window_us:
-                continue                     # skip – too soon
+                continue
             last_on_time[ev.channel] = ev.timestamp_us
             result.append(ev)
         else:
-            result.append(ev)               # always keep NOTE_OFF
+            result.append(ev)
 
     return result
 
@@ -404,28 +329,9 @@ def enforce_min_gap_chord_aware(events: list[SolenoidEvent],
                                 min_gap_us: int = MIN_GAP_US,
                                 chord_window_us: int = CHORD_WINDOW_US
                                 ) -> list[SolenoidEvent]:
-    """
-    Groups events within chord_window_us of each other into a single
-    chord group, then enforces min_gap_us BETWEEN groups only.
-
-    Fixes the bug in enforce_min_gap_global:
-      Example: C1@0.00s, C2@0.05s, C3@0.06s with 100 ms gap.
-      - Old (per-channel global shift): C2 gets shifted to 0.11s, but C3
-        is still at 0.06s so it plays BEFORE C2 — the shift reordered
-        the song.
-      - This version: operates on GROUPS, so the relative ordering of
-        notes in a "cluster" is preserved and chords stay simultaneous.
-
-    All events inside a group receive the same (possibly-adjusted)
-    timestamp, and a group's timestamp is never moved earlier than its
-    original time.
-    """
     if not events:
         return []
 
-    # --- 1. Build chord groups -------------------------------------------
-    # A new group starts whenever the gap from the first event of the current
-    # group exceeds chord_window_us.
     groups: list[list[SolenoidEvent]] = [[events[0]]]
     for ev in events[1:]:
         if ev.timestamp_us - groups[-1][0].timestamp_us <= chord_window_us:
@@ -433,19 +339,14 @@ def enforce_min_gap_chord_aware(events: list[SolenoidEvent],
         else:
             groups.append([ev])
 
-    # --- 2. Assign timestamps, enforcing min gap between groups -----------
     result: list[SolenoidEvent] = []
     scheduled_time: int = 0
 
     for idx, g in enumerate(groups):
         original_time = g[0].timestamp_us
-
         if idx == 0:
-            # First group: never shift earlier, no gap requirement yet.
             t = original_time
         else:
-            # Must be at least min_gap_us after the previous group AND
-            # no earlier than where the MIDI file placed it.
             t = max(original_time, scheduled_time + min_gap_us)
 
         for ev in g:
@@ -455,28 +356,18 @@ def enforce_min_gap_chord_aware(events: list[SolenoidEvent],
                 event_type=ev.event_type,
                 velocity=ev.velocity,
             ))
-
         scheduled_time = t
 
     return result
+
 
 def enforce_min_gap_per_channel(events: list[SolenoidEvent],
                                 min_gap_us: int = MIN_GAP_US,
                                 chord_window_us: int = CHORD_WINDOW_US
                                 ) -> list[SolenoidEvent]:
-    """
-    Per-channel minimum gap. A group's timestamp is only pushed forward if
-    one of ITS channels had a recent NOTE_ON that's too close. Unrelated
-    channels never slow each other down, so fast melodies across different
-    solenoids play at full MIDI speed.
-
-    Chord grouping is preserved: events within chord_window_us get a shared
-    timestamp and move as a unit.
-    """
     if not events:
         return []
 
-    # --- 1. Build chord groups -------------------------------------------
     groups: list[list[SolenoidEvent]] = [[events[0]]]
     for ev in events[1:]:
         if ev.timestamp_us - groups[-1][0].timestamp_us <= chord_window_us:
@@ -484,7 +375,6 @@ def enforce_min_gap_per_channel(events: list[SolenoidEvent],
         else:
             groups.append([ev])
 
-    # --- 2. Shift only when a channel in the group has a recent ON -------
     adjusted: list[tuple[int, list[SolenoidEvent]]] = []
     last_on_per_channel: dict[int, int] = {}
 
@@ -503,10 +393,8 @@ def enforce_min_gap_per_channel(events: list[SolenoidEvent],
             if ev.event_type == EventType.NOTE_ON:
                 last_on_per_channel[ev.channel] = earliest
 
-    # Re-sort: a heavily-shifted group could end up after a later one
     adjusted.sort(key=lambda x: x[0])
 
-    # --- 3. Emit ---------------------------------------------------------
     result: list[SolenoidEvent] = []
     for t, g in adjusted:
         for ev in g:
@@ -518,33 +406,15 @@ def enforce_min_gap_per_channel(events: list[SolenoidEvent],
             ))
     return result
 
-# Tune these
-NOTE_EXTEND_US       = 50_000   # push every OFF back by this much -20 , 35
-MIN_NOTE_DURATION_US = 120_000   # floor: every note must last at least this long -30, 50
+
+NOTE_EXTEND_US       = 50_000
+MIN_NOTE_DURATION_US = 120_000
+
 
 def extend_note_durations(events: list[SolenoidEvent],
                           extend_us: int = NOTE_EXTEND_US,
                           min_duration_us: int = MIN_NOTE_DURATION_US,
                           ) -> list[SolenoidEvent]:
-    """
-    Push NOTE_OFF events LATER to give each note time to actually ring on
-    the solenoid piano. For fast runs, the original MIDI durations are too
-    short for the hammer/string interaction to sound, so we intentionally
-    slur notes together by delaying their releases.
-
-    For each NOTE_OFF, the new off time is:
-
-        new_off = max(on_time + min_duration_us, original_off + extend_us)
-
-    ...clamped so it never crosses the NEXT NOTE_ON on the same channel
-    (same-channel overlap makes no physical sense — a key is down or up).
-
-    NOTE_ONs are never moved; their timestamps are the perceptually
-    critical ones.
-    """
-    import bisect
-
-    # Per-channel sorted list of NOTE_ON timestamps, for fast "next ON" lookup.
     on_times_by_channel: dict[int, list[int]] = {}
     for ev in events:
         if ev.event_type == EventType.NOTE_ON:
@@ -559,25 +429,19 @@ def extend_note_durations(events: list[SolenoidEvent],
             result.append(ev)
             continue
 
-        # NOTE_OFF: figure out where it's allowed to end up
         on_time = last_on_per_channel.get(ev.channel)
         if on_time is None:
-            # Orphan OFF (no matching ON) — leave it alone
             result.append(ev)
             continue
 
         desired_off = max(on_time + min_duration_us,
                           ev.timestamp_us + extend_us)
 
-        # Cap at the next NOTE_ON on this channel (minus 1 µs margin),
-        # otherwise the firmware sees OFF and ON at the same instant
-        # and the ordering is ambiguous.
         ons = on_times_by_channel.get(ev.channel, [])
         idx = bisect.bisect_right(ons, ev.timestamp_us)
         if idx < len(ons):
             desired_off = min(desired_off, ons[idx] - 1)
 
-        # Never shorten a note below its original length
         new_off = max(ev.timestamp_us, desired_off)
 
         result.append(SolenoidEvent(
@@ -590,30 +454,14 @@ def extend_note_durations(events: list[SolenoidEvent],
     result.sort(key=lambda e: e.timestamp_us)
     return result
 
-FAST_RUN_THRESHOLD_US = 80_000   # only extend if next ON arrives within this
-MIN_NOTE_DURATION_US  = 50_000   # target minimum on-to-off duration in fast runs
+
+FAST_RUN_THRESHOLD_US = 80_000
+
 
 def extend_fast_run_offs(events: list[SolenoidEvent],
                          fast_threshold_us: int = FAST_RUN_THRESHOLD_US,
                          min_duration_us: int = MIN_NOTE_DURATION_US,
                          ) -> list[SolenoidEvent]:
-    """
-    Delay NOTE_OFF events only when they occur inside a fast run — i.e. when
-    the next NOTE_ON (on any channel) arrives within fast_threshold_us of
-    this OFF. In that case, push the OFF late enough that the note lasts
-    at least min_duration_us from its own NOTE_ON.
-
-    Isolated notes with a long gap to the next event are left untouched,
-    so sustained passages don't get smeared.
-
-    Caps:
-      • Never moves an OFF earlier than its original time.
-      • Never pushes an OFF past the next NOTE_ON on the SAME channel
-        (would make hammer state ambiguous).
-    """
-    import bisect
-
-    # Sorted NOTE_ON timestamps: global (any channel) + per-channel.
     all_on_times: list[int] = []
     on_times_by_channel: dict[int, list[int]] = {}
     for ev in events:
@@ -633,11 +481,9 @@ def extend_fast_run_offs(events: list[SolenoidEvent],
 
         on_time = last_on_per_channel.get(ev.channel)
         if on_time is None:
-            result.append(ev)   # orphan OFF, skip
+            result.append(ev)
             continue
 
-        # Is this a fast run? Look for the next NOTE_ON (any channel) AFTER
-        # this OFF and see how close it is.
         idx = bisect.bisect_right(all_on_times, ev.timestamp_us)
         in_fast_run = (
             idx < len(all_on_times)
@@ -645,12 +491,10 @@ def extend_fast_run_offs(events: list[SolenoidEvent],
         )
 
         if not in_fast_run:
-            result.append(ev)   # slow passage — leave alone
+            result.append(ev)
             continue
 
         desired_off = on_time + min_duration_us
-
-        # Cap at the next ON on this channel so we don't cross it.
         ch_ons = on_times_by_channel.get(ev.channel, [])
         ch_idx = bisect.bisect_right(ch_ons, ev.timestamp_us)
         if ch_idx < len(ch_ons):
@@ -667,6 +511,37 @@ def extend_fast_run_offs(events: list[SolenoidEvent],
 
     result.sort(key=lambda e: e.timestamp_us)
     return result
+
+
+OFF_SHIFT_US = 30_000
+MIN_NOTE_US  = 40_000
+
+
+def decouple_offs_from_ons(events: list[SolenoidEvent],
+                           shift_us: int = OFF_SHIFT_US,
+                           min_note_us: int = MIN_NOTE_US
+                           ) -> list[SolenoidEvent]:
+    last_on_per_channel: dict[int, int] = {}
+    result: list[SolenoidEvent] = []
+
+    for ev in events:
+        if ev.event_type == EventType.NOTE_ON:
+            last_on_per_channel[ev.channel] = ev.timestamp_us
+            result.append(ev)
+        else:
+            on_time = last_on_per_channel.get(ev.channel, 0)
+            max_early    = ev.timestamp_us - (on_time + min_note_us)
+            actual_shift = max(0, min(shift_us, max_early))
+            result.append(SolenoidEvent(
+                timestamp_us=ev.timestamp_us - actual_shift,
+                channel=ev.channel,
+                event_type=ev.event_type,
+                velocity=ev.velocity,
+            ))
+
+    result.sort(key=lambda e: e.timestamp_us)
+    return result
+
 
 # ---------------------------------------------------------------------------
 # MIDI parser
@@ -717,63 +592,17 @@ def parse_midi_file(filepath: str | Path) -> SongData:
 
     song.events.sort(key=lambda e: e.timestamp_us)
 
-    # --- Timing cleanup pipeline -----------------------------------------
-    # 1. Merge very fast OFF→ON restrikes into ON→ON (firmware handles those)
-    song.events = merge_fast_restrikes(song.events, RESTRIKE_WINDOW_US) #COMMENTED THIS OUT BECAUSE ITS SHIT
-    # 2. Drop duplicate ONs that arrive faster than a solenoid can reset
-    #song.events = remove_fast_duplicate_ons(song.events, DUPLICATE_ON_US) COMMENTED THIS OUT BECAUSE ITS SHIT
-    # 3. Enforce minimum inter-group gap WITHOUT splitting chords or
-    #    re-ordering overlapping notes.
-    #song.events = enforce_min_gap_chord_aware(song.events, MIN_GAP_US, CHORD_WINDOW_US)
-    # was: song.events = enforce_min_gap_chord_aware(song.events, MIN_GAP_US, CHORD_WINDOW_US)
+    song.events = merge_fast_restrikes(song.events, RESTRIKE_WINDOW_US)
     song.events = enforce_min_gap_per_channel(song.events, MIN_GAP_US, CHORD_WINDOW_US)
-    #song.events = decouple_offs_from_ons(song.events, OFF_SHIFT_US, MIN_NOTE_US)
-    song.events = extend_note_durations(song.events, NOTE_EXTEND_US, MIN_NOTE_DURATION_US) #- this might work
-    #song.events = extend_fast_run_offs(song.events, FAST_RUN_THRESHOLD_US, MIN_NOTE_DURATION_US)
+    song.events = extend_note_durations(song.events, NOTE_EXTEND_US, MIN_NOTE_DURATION_US)
 
     if song.events:
         song.duration_us = song.events[-1].timestamp_us
 
+    # Pre-pair notes for the visualizer.
+    song.note_segments = build_note_segments(song.events)
+
     return song
-
-OFF_SHIFT_US = 30_000   # shift OFFs this much earlier to declutter transitions
-MIN_NOTE_US  = 40_000   # never shorten a note below this
-
-def decouple_offs_from_ons(events: list[SolenoidEvent],
-                           shift_us: int = OFF_SHIFT_US,
-                           min_note_us: int = MIN_NOTE_US
-                           ) -> list[SolenoidEvent]:
-    """
-    Shift NOTE_OFFs earlier by up to shift_us, bounded by min_note_us so
-    we never collapse a note too short. NOTE_ONs are never touched — their
-    timestamps are the perceptually critical ones.
-
-    Reduces peak events-per-timestamp at chord transitions where OFFs for
-    the outgoing chord collide with ONs for the incoming chord, which is
-    what causes the firmware's I²C dispatch queue to back up.
-    """
-    last_on_per_channel: dict[int, int] = {}
-    result: list[SolenoidEvent] = []
-
-    for ev in events:
-        if ev.event_type == EventType.NOTE_ON:
-            last_on_per_channel[ev.channel] = ev.timestamp_us
-            result.append(ev)
-        else:  # NOTE_OFF
-            on_time = last_on_per_channel.get(ev.channel, 0)
-            # How far earlier can this OFF go without shortening the note
-            # below min_note_us?
-            max_early      = ev.timestamp_us - (on_time + min_note_us)
-            actual_shift   = max(0, min(shift_us, max_early))
-            result.append(SolenoidEvent(
-                timestamp_us=ev.timestamp_us - actual_shift,
-                channel=ev.channel,
-                event_type=ev.event_type,
-                velocity=ev.velocity,
-            ))
-
-    result.sort(key=lambda e: e.timestamp_us)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -797,7 +626,6 @@ def build_command_packet(cmd: int) -> bytes:
 
 
 def send_packet(ser: serial.Serial, packet: bytes) -> None:
-    """Write a packet and flush the OS buffer before waiting for a reply."""
     ser.write(packet)
     try:
         ser.flush()
@@ -806,19 +634,8 @@ def send_packet(ser: serial.Serial, packet: bytes) -> None:
 
 
 def wait_for_ack(ser: serial.Serial, timeout: float = ACK_TIMEOUT_S) -> int | None:
-    """
-    Scan incoming bytes for a valid ACK and return the firmware's reported
-    free-slot count. Returns None on timeout.
-
-    ACK frame layout (6 bytes):
-        [PACKET_HEADER] [CMD_ACK] [free_lo] [free_hi] [checksum] [FOOTER]
-
-    Any stray bytes before the header (firmware debug prints, boot garbage,
-    etc.) are discarded. We intentionally don't validate checksum/footer
-    strictly — same leniency as the original working protocol.
-    """
     deadline = time.monotonic() + timeout
-    ser.timeout = 0.05  # short per-read timeout so we can poll deadline
+    ser.timeout = 0.05
 
     while time.monotonic() < deadline:
         b = ser.read(1)
@@ -828,10 +645,7 @@ def wait_for_ack(ser: serial.Serial, timeout: float = ACK_TIMEOUT_S) -> int | No
             continue
         cmd_byte = ser.read(1)
         if len(cmd_byte) < 1 or cmd_byte[0] != CMD_ACK:
-            # Not an ACK after a header — keep scanning for a fresh header.
             continue
-        # Read free_lo, free_hi, checksum, footer. We don't care about the
-        # last two; draining them keeps them from polluting the next read.
         tail = ser.read(4)
         if len(tail) < 4:
             continue
@@ -842,7 +656,6 @@ def wait_for_ack(ser: serial.Serial, timeout: float = ACK_TIMEOUT_S) -> int | No
 
 
 def drain_input(ser: serial.Serial) -> None:
-    """Dump whatever is currently waiting in the input buffer."""
     try:
         ser.reset_input_buffer()
     except Exception:
@@ -859,6 +672,787 @@ def extract_port_name(port_string: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Visualizer Window
+# ---------------------------------------------------------------------------
+
+class VisualizerWindow(ctk.CTkToplevel):
+    """
+    Synthesia-style falling-notes visualizer. Reads playback state from
+    the parent app and renders at ~30 FPS.
+
+    Sync: parent app exposes `playback_start_monotonic` and
+    `playback_time_offset_us`. Current song-time (in microseconds) is:
+        time_offset_us + (time.monotonic() - playback_start_monotonic) * 1e6
+    When playback isn't active we sit at offset 0 (or the saved pause point).
+    """
+
+    def __init__(self, master_app: "SolenoidPianoApp"):
+        super().__init__(master_app)
+        self.master_app = master_app
+
+        self.title("Solenoid Piano — Visualizer")
+        self.geometry("1400x700")
+        self.minsize(900, 450)
+        self.configure(fg_color=VIS_BG)
+
+        # Hide instead of destroy on close — the main app owns lifetime.
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Fullscreen state. When True the OS titlebar is hidden and we
+        # show our own custom titlebar only when the mouse is near the
+        # top of the window.
+        self._fullscreen = False
+        self._custom_titlebar_visible = False
+        # Original geometry remembered so exiting fullscreen restores it.
+        self._pre_fullscreen_geom: str | None = None
+
+        # --- Header bar (split layout: scrolling filename + fixed info) ---
+        # Left side: a clipping Canvas that draws the filename text. If the
+        # filename is too long, it scrolls marquee-style with a tail gap.
+        # Right side: Song Duration + Current Song Progress, anchored to
+        # the right edge so they never get pushed off-screen.
+        self._build_header()
+
+        # --- Canvas: notes fall here, keyboard at bottom ------------------
+        self.canvas = tk.Canvas(
+            self, bg=VIS_BG, highlightthickness=0, bd=0,
+        )
+        self.canvas.pack(fill="both", expand=True)
+
+        # Cached layout — recomputed on resize
+        self._layout_dirty = True
+        self._key_rects: dict[int, tuple[int, int, int, int]] = {}  # midi -> (x0,y0,x1,y1)
+        self._white_key_width = 0
+        self._black_key_width = 0
+        self._keyboard_top_y = 0
+        self._canvas_w = 0
+        self._canvas_h = 0
+
+        self.canvas.bind("<Configure>", self._on_resize)
+
+        # --- Custom titlebar overlay (only visible in fullscreen) ---------
+        # In fullscreen we strip the OS window decorations with
+        # overrideredirect, then show this overlay when the user moves the
+        # mouse near the top edge. It sits above all other widgets via
+        # `place()` and gets hidden with `place_forget()`.
+        self._build_custom_titlebar()
+
+        # --- Hotkeys ------------------------------------------------------
+        # F11 toggles fullscreen, Esc exits it. Standard for media players.
+        self.bind("<F11>", lambda e: self.toggle_fullscreen())
+        self.bind("<Escape>", lambda e: self._exit_fullscreen())
+
+        # Track mouse motion across the whole window so we can show/hide
+        # the custom titlebar based on cursor proximity to the top edge.
+        self.bind("<Motion>", self._on_mouse_motion)
+
+        # Animation tick
+        self._running = True
+        self.after(VIS_FRAME_INTERVAL_MS, self._tick)
+
+    # -- Header construction (split layout with scrolling filename) ---------
+
+    def _build_header(self):
+        """
+        Layout:
+          [ filename canvas (scrolling)         ] [ duration | progress ]
+          <-------- ~55% width --------><pad>     <-- anchored right -->
+
+        Implementation:
+          - Outer `header_frame` is the orange bar; it's packed at top
+            with fill="x" so it grows with the window.
+          - `filename_canvas` is `place()`d on the left at (PAD_X, 0) with
+            its width recomputed on every resize. We draw the filename
+            text into it — twice, with a tail gap, when scrolling.
+          - `right_label` is `place()`d at (relx=1.0, anchor="ne") so it
+            hugs the right edge regardless of window width.
+
+        We use `place()` instead of `pack()` for both children because we
+        need precise pixel control and the right-anchored field has to be
+        independent of how wide the left field is.
+        """
+        # Header frame stand-in for the old single Label. The bar uses the
+        # same orange (VIS_HEADER_BG) and the same vertical padding the
+        # old Label used, so the bar height matches the previous look.
+        self.header_frame = tk.Frame(
+            self, bg=VIS_HEADER_BG,
+            height=self._compute_header_height(),
+        )
+        # `pack_propagate(False)` prevents the frame from shrinking to fit
+        # its children (the children are placed, not packed, so by default
+        # the frame would collapse to height=1).
+        self.header_frame.pack_propagate(False)
+        self.header_frame.pack(fill="x", side="top")
+
+        # Right-side fixed labels (Duration | Progress). We use a single
+        # Label instead of two because the text is always rendered as one
+        # string and one widget is cheaper than two.
+        self.right_label = tk.Label(
+            self.header_frame,
+            text="Song Duration: 0.0s | Current Song Progress: 0.0s",
+            font=VIS_HEADER_FONT,
+            fg=VIS_HEADER_FG, bg=VIS_HEADER_BG,
+            anchor="e",
+        )
+        self.right_label.place(
+            relx=1.0, rely=0.5, x=-VIS_HEADER_PAD_X, anchor="e",
+        )
+
+        # Left-side scrolling filename canvas. Width is set in
+        # `_layout_header()` based on the actual frame width.
+        self.filename_canvas = tk.Canvas(
+            self.header_frame,
+            bg=VIS_HEADER_BG,
+            highlightthickness=0, bd=0,
+        )
+        self.filename_canvas.place(
+            x=VIS_HEADER_PAD_X, rely=0.5, anchor="w",
+        )
+
+        # Marquee state. `_marquee_offset_px` is how far the text has
+        # scrolled left (always >= 0). When it exceeds one full text+tail
+        # width, we wrap it back to 0.
+        self._filename_text         = "----------Waiting for Upload----------"
+        self._filename_needs_scroll = False
+        self._filename_text_width   = 0   # measured on draw
+        self._marquee_offset_px     = 0.0
+        self._marquee_last_tick_s   = time.monotonic()
+
+        # Recompute the header layout when the window resizes.
+        self.header_frame.bind("<Configure>", self._on_header_resize)
+
+    def _compute_header_height(self) -> int:
+        """
+        Header height needs to match what the old single-Label used so the
+        bar looks identical. The Label sized itself based on font height
+        plus pady; we replicate that here.
+        """
+        # Tk doesn't give us font metrics until the root exists, so we
+        # approximate: font size in points * ~1.5 line-height + 2*pady.
+        # The font is ("Consolas", 26), so ~26 * 1.5 = 39 + 2*27 = 93.
+        # That matches the visible bar height in your screenshots.
+        font_size = VIS_HEADER_FONT[1]
+        line_height = int(font_size * 1.5)
+        return line_height + 2 * VIS_HEADER_PAD_Y
+
+    def _on_header_resize(self, event):
+        self._layout_header()
+
+    def _layout_header(self):
+        """Resize the filename canvas to match the current header width."""
+        try:
+            frame_w = self.header_frame.winfo_width()
+            frame_h = self.header_frame.winfo_height()
+        except tk.TclError:
+            return
+        if frame_w <= 1 or frame_h <= 1:
+            return
+
+        # Measure the right label's actual rendered width so we can reserve
+        # exactly that much space (plus a gap) on the right side. Without
+        # this, the filename canvas can extend underneath the right label
+        # and its text will visually overlap.
+        try:
+            self.right_label.update_idletasks()
+            right_w = self.right_label.winfo_reqwidth()
+        except tk.TclError:
+            right_w = 0
+
+        # Gap between the filename region and the right-anchored info,
+        # plus the existing right-edge padding the label already uses.
+        gap_between = 24
+        right_reserved = right_w + VIS_HEADER_PAD_X + gap_between
+
+        # Filename region: bounded above by the percentage cap, bounded
+        # below by what's actually free after reserving the right side.
+        max_by_frac    = int(frame_w * VIS_HEADER_FILENAME_FRAC)
+        max_by_space   = frame_w - VIS_HEADER_PAD_X - right_reserved
+        filename_w = max(50, min(max_by_frac, max_by_space))
+
+        canvas_h = frame_h
+        self.filename_canvas.configure(width=filename_w, height=canvas_h)
+
+        # Re-draw with the new region width (changes whether scrolling
+        # is needed and re-measures text width if font changed).
+        self._redraw_filename()
+
+    def _set_filename_display(self, text: str):
+        """Public-ish helper — call when the song changes."""
+        if text == self._filename_text:
+            return
+        self._filename_text = text
+        self._marquee_offset_px = 0.0
+        self._marquee_last_tick_s = time.monotonic()
+        self._redraw_filename()
+
+    def _redraw_filename(self):
+        """
+        Draw the filename text into the canvas. If the text fits inside
+        the canvas width, draw it once, statically. If not, draw it twice
+        (separated by a tail gap) and let the marquee tick scroll it.
+        """
+        c = self.filename_canvas
+        try:
+            c.delete("all")
+        except tk.TclError:
+            return
+
+        try:
+            cw = c.winfo_width()
+            ch = c.winfo_height()
+        except tk.TclError:
+            return
+        if cw <= 1 or ch <= 1:
+            return
+
+        # Measure the text width by drawing it at an offscreen position,
+        # querying its bbox, then erasing. This is the only reliable way
+        # to know rendered text width with a given font in Tk.
+        probe = c.create_text(
+            -10000, ch // 2,
+            text=self._filename_text,
+            font=VIS_HEADER_FONT,
+            fill=VIS_HEADER_FG,
+            anchor="w",
+        )
+        bbox = c.bbox(probe)
+        c.delete(probe)
+        text_w = (bbox[2] - bbox[0]) if bbox else 0
+        self._filename_text_width = text_w
+
+        # Decide: scroll or static?
+        self._filename_needs_scroll = text_w > cw
+
+        if not self._filename_needs_scroll:
+            # Static render at the left edge.
+            c.create_text(
+                0, ch // 2,
+                text=self._filename_text,
+                font=VIS_HEADER_FONT,
+                fill=VIS_HEADER_FG,
+                anchor="w",
+                tags=("marquee",),
+            )
+            return
+
+        # Scrolling render: draw two copies with a tail gap. The marquee
+        # tick adjusts both x positions every frame.
+        gap = VIS_MARQUEE_TAIL_PX
+        x0 = -int(self._marquee_offset_px)
+        x1 = x0 + text_w + gap
+        for x in (x0, x1):
+            c.create_text(
+                x, ch // 2,
+                text=self._filename_text,
+                font=VIS_HEADER_FONT,
+                fill=VIS_HEADER_FG,
+                anchor="w",
+                tags=("marquee",),
+            )
+
+    def _tick_marquee(self):
+        """
+        Advance the marquee offset based on real elapsed time. Called from
+        the main render tick so we share a single timer instead of
+        spawning a second `after()` loop.
+        """
+        now = time.monotonic()
+        dt = now - self._marquee_last_tick_s
+        self._marquee_last_tick_s = now
+
+        if not self._filename_needs_scroll:
+            return
+
+        # Advance offset; wrap when one full (text + gap) has scrolled by.
+        self._marquee_offset_px += dt * VIS_MARQUEE_PX_PER_SEC
+        loop_w = self._filename_text_width + VIS_MARQUEE_TAIL_PX
+        if loop_w > 0 and self._marquee_offset_px >= loop_w:
+            self._marquee_offset_px -= loop_w
+
+        # Update positions of existing text items instead of redrawing
+        # — much cheaper.
+        c = self.filename_canvas
+        try:
+            items = c.find_withtag("marquee")
+        except tk.TclError:
+            return
+        if len(items) != 2:
+            # Out of sync (e.g. a resize just happened). Force a redraw.
+            self._redraw_filename()
+            return
+
+        ch = c.winfo_height()
+        x0 = -int(self._marquee_offset_px)
+        x1 = x0 + loop_w
+        try:
+            c.coords(items[0], x0, ch // 2)
+            c.coords(items[1], x1, ch // 2)
+        except tk.TclError:
+            pass
+
+    # -- Custom titlebar (fullscreen mode only) ------------------------------
+
+    def _build_custom_titlebar(self):
+        """
+        A thin floating bar with title text + minimize/close buttons.
+        Only shown when in fullscreen mode AND the mouse is near the top.
+        Built once, placed/forgotten as needed.
+        """
+        bar_h = 32
+        self._titlebar_height = bar_h
+
+        self.custom_titlebar = tk.Frame(
+            self, bg="#1a1a1a", height=bar_h,
+        )
+        # Don't pack now — we use place() to overlay it later.
+
+        # Title text on the left
+        tk.Label(
+            self.custom_titlebar,
+            text="Solenoid Piano — Visualizer",
+            font=("Segoe UI", 11),
+            fg="#e0e0e0", bg="#1a1a1a",
+            padx=12,
+        ).pack(side="left", fill="y")
+
+        # Window-control buttons on the right (close, then minimize, so
+        # they pack outward in the conventional order from the right edge).
+        btn_common = dict(
+            font=("Segoe UI", 11, "bold"),
+            fg="#e0e0e0", bg="#1a1a1a",
+            activebackground="#3a3a3a", activeforeground="#ffffff",
+            bd=0, relief="flat", padx=14, pady=2, cursor="hand2",
+        )
+
+        close_btn = tk.Button(
+            self.custom_titlebar, text="✕",
+            command=self._on_close, **btn_common,
+        )
+        close_btn.pack(side="right", fill="y")
+        # Close button gets a red hover specifically (matches OS conventions).
+        close_btn.bind("<Enter>",
+                       lambda e: close_btn.configure(bg="#c0392b"))
+        close_btn.bind("<Leave>",
+                       lambda e: close_btn.configure(bg="#1a1a1a"))
+
+        min_btn = tk.Button(
+            self.custom_titlebar, text="—",
+            command=self._minimize, **btn_common,
+        )
+        min_btn.pack(side="right", fill="y")
+        min_btn.bind("<Enter>",
+                     lambda e: min_btn.configure(bg="#3a3a3a"))
+        min_btn.bind("<Leave>",
+                     lambda e: min_btn.configure(bg="#1a1a1a"))
+
+        # Mouse motion inside the titlebar should keep it visible
+        # (without this it'd flicker as you move toward the buttons).
+        self.custom_titlebar.bind("<Motion>", self._on_mouse_motion)
+
+    def _show_custom_titlebar(self):
+        if self._custom_titlebar_visible:
+            return
+        # place() over the top of everything else, full width.
+        self.custom_titlebar.place(
+            x=0, y=0, relwidth=1.0, height=self._titlebar_height,
+        )
+        self.custom_titlebar.lift()
+        self._custom_titlebar_visible = True
+
+    def _hide_custom_titlebar(self):
+        if not self._custom_titlebar_visible:
+            return
+        self.custom_titlebar.place_forget()
+        self._custom_titlebar_visible = False
+
+    def _on_mouse_motion(self, event):
+        """
+        Show the custom titlebar when the cursor is near the top of the
+        window in fullscreen mode; hide it otherwise. We translate the
+        event coordinates to window-local space because <Motion> on a
+        child widget reports event.y relative to that child.
+        """
+        if not self._fullscreen:
+            return
+
+        # Window-local Y of the cursor
+        try:
+            win_y = self.winfo_pointery() - self.winfo_rooty()
+        except tk.TclError:
+            return
+
+        # Show whenever the cursor is in the top 40px reveal zone, OR
+        # already inside the titlebar itself (so it doesn't snap away
+        # when you move toward the close button).
+        reveal_zone = 40
+        if win_y <= reveal_zone or (
+            self._custom_titlebar_visible and win_y <= self._titlebar_height
+        ):
+            self._show_custom_titlebar()
+        else:
+            self._hide_custom_titlebar()
+
+    def _minimize(self):
+        # overrideredirect windows can't be iconified directly on most
+        # platforms; the workaround is to drop overrideredirect, iconify,
+        # then restore it on the next Map event.
+        if self._fullscreen:
+            self.overrideredirect(False)
+            self.iconify()
+            # When the user un-minimizes, re-apply borderless fullscreen.
+            self.bind("<Map>", self._reapply_fullscreen_after_minimize)
+        else:
+            self.iconify()
+
+    def _reapply_fullscreen_after_minimize(self, event):
+        # One-shot: only fire on the first map after a minimize.
+        self.unbind("<Map>")
+        if self._fullscreen:
+            # Restore borderless + screen-sized geometry.
+            self.overrideredirect(True)
+            self._apply_borderless_fullscreen_geometry()
+
+    # -- Fullscreen toggling ------------------------------------------------
+
+    def _apply_borderless_fullscreen_geometry(self):
+        """Size the window to the full screen (work area + taskbar)."""
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        self.geometry(f"{sw}x{sh}+0+0")
+
+    def toggle_fullscreen(self):
+        if self._fullscreen:
+            self._exit_fullscreen()
+        else:
+            self._enter_fullscreen()
+
+    def _enter_fullscreen(self):
+        if self._fullscreen:
+            return
+        # Remember current geometry so we can restore it.
+        self._pre_fullscreen_geom = self.geometry()
+        self._fullscreen = True
+
+        # overrideredirect strips the OS titlebar, borders, and resize
+        # handles. The window becomes a plain rectangle we control.
+        self.overrideredirect(True)
+        self._apply_borderless_fullscreen_geometry()
+        self.lift()
+
+        # Don't show the custom titlebar immediately — wait for hover.
+        self._hide_custom_titlebar()
+
+    def _exit_fullscreen(self):
+        if not self._fullscreen:
+            return
+        self._fullscreen = False
+        self._hide_custom_titlebar()
+
+        # Restore OS decorations and previous geometry.
+        self.overrideredirect(False)
+        if self._pre_fullscreen_geom:
+            self.geometry(self._pre_fullscreen_geom)
+
+    # -- Lifecycle ----------------------------------------------------------
+
+    def _on_close(self):
+        # Hide rather than destroy so reopening is cheap.
+        # Bail out of fullscreen first so the next show() comes back in
+        # a normal window state.
+        if self._fullscreen:
+            self._exit_fullscreen()
+        self.withdraw()
+
+    def show(self):
+        self.deiconify()
+        self.lift()
+
+    # -- Layout -------------------------------------------------------------
+
+    def _on_resize(self, event):
+        self._canvas_w = event.width
+        self._canvas_h = event.height
+        self._layout_dirty = True
+
+    def _compute_layout(self):
+        """Compute key rectangles for an 88-key piano (MIDI 21..108)."""
+        w = max(1, self._canvas_w)
+        h = max(1, self._canvas_h)
+
+        # Keyboard takes ~22% of canvas height, capped so it doesn't
+        # eat the whole window on tall layouts.
+        kb_h = max(80, min(int(h * 0.22), 160))
+        self._keyboard_top_y = h - kb_h
+
+        white_w = w / VIS_NUM_WHITE
+        # Black keys are ~60% white-key width in a real piano
+        black_w = white_w * 0.60
+        self._white_key_width = white_w
+        self._black_key_width = black_w
+
+        # First, lay out white keys left-to-right
+        white_x_for_midi: dict[int, float] = {}
+        white_idx = 0
+        for midi in range(VIS_FIRST_MIDI, VIS_LAST_MIDI + 1):
+            if not is_black_key(midi):
+                white_x_for_midi[midi] = white_idx * white_w
+                white_idx += 1
+
+        # White key rects fill their slot
+        rects: dict[int, tuple[int, int, int, int]] = {}
+        for midi, x0 in white_x_for_midi.items():
+            x1 = x0 + white_w
+            rects[midi] = (
+                int(x0), int(self._keyboard_top_y),
+                int(x1), int(h),
+            )
+
+        # Black keys are positioned between adjacent white keys.
+        # In each octave: C# sits between C and D, D# between D and E, etc.
+        for midi in range(VIS_FIRST_MIDI, VIS_LAST_MIDI + 1):
+            if not is_black_key(midi):
+                continue
+            # The white key just to the left of this black key is midi-1.
+            left_white = midi - 1
+            if left_white not in white_x_for_midi:
+                continue
+            left_x = white_x_for_midi[left_white]
+            # Center the black key over the boundary between left and right whites
+            cx = left_x + white_w
+            x0 = cx - black_w / 2
+            x1 = cx + black_w / 2
+            black_h = int(kb_h * 0.62)
+            rects[midi] = (
+                int(x0), int(self._keyboard_top_y),
+                int(x1), int(self._keyboard_top_y + black_h),
+            )
+
+        self._key_rects = rects
+        self._layout_dirty = False
+
+    # -- Time sync ----------------------------------------------------------
+
+    def _current_song_us(self) -> int:
+        """
+        The instantaneous playhead position in song-time microseconds.
+        Mirrors the worker's computation but uses whatever values the
+        worker has published. When not playing, returns the saved
+        pause point (or 0).
+        """
+        app = self.master_app
+        start_mono = app.playback_start_monotonic
+        offset_us  = app.playback_time_offset_us
+
+        if app.is_transmitting and start_mono is not None:
+            elapsed_s = time.monotonic() - start_mono
+            return offset_us + int(elapsed_s * 1_000_000)
+
+        # Not playing — show pause position if any, else 0.
+        if app._paused_song_us is not None:
+            return app._paused_song_us
+        return 0
+
+    # -- Rendering ----------------------------------------------------------
+
+    def _tick(self):
+        if not self._running:
+            return
+        try:
+            self._render()
+            self._tick_marquee()
+        except tk.TclError:
+            # Window destroyed mid-render
+            return
+        self.after(VIS_FRAME_INTERVAL_MS, self._tick)
+
+    def _render(self):
+        if self._layout_dirty:
+            self._compute_layout()
+
+        c = self.canvas
+        c.delete("all")
+
+        w = self._canvas_w
+        h = self._canvas_h
+        kb_top = self._keyboard_top_y
+
+        # Update header text
+        self._update_header()
+
+        # Background grid lines (subtle vertical guides every octave)
+        for midi in range(VIS_FIRST_MIDI, VIS_LAST_MIDI + 1):
+            if midi % 12 == 0:  # every C
+                rect = self._key_rects.get(midi)
+                if rect:
+                    x = rect[0]
+                    c.create_line(x, 0, x, kb_top,
+                                  fill=VIS_GUIDELINE, width=1)
+
+        # Falling notes
+        playhead_us = self._current_song_us()
+        song = self.master_app.song
+        if song and song.note_segments:
+            self._draw_falling_notes(song.note_segments, playhead_us, kb_top)
+
+        # Red playhead line at the top of the keyboard
+        c.create_line(0, kb_top, w, kb_top,
+                      fill=VIS_PLAYLINE, width=2)
+
+        # Keyboard (compute active keys from current playhead)
+        active_channels = self._active_channels_at(playhead_us)
+        self._draw_keyboard(active_channels)
+
+    def _update_header(self):
+        """
+        Push the latest filename + duration/progress strings into the
+        split header. Filename text itself is set via _set_filename_display
+        so the marquee state stays consistent.
+        """
+        song = self.master_app.song
+        playhead_us = self._current_song_us()
+
+        def fmt_mmss(seconds: float) -> str:
+            # Floor to whole seconds so the display ticks cleanly each
+            # second instead of showing fractional rollover.
+            total = int(seconds)
+            return f"{total // 60}:{total % 60:02d}"
+
+        if song is None:
+            display_name = "----------Waiting for Upload----------"
+            right_text = "Current Song Progess: 0:00 / 0:00"
+        else:
+            display_name = strip_midi_extension(song.filename)
+            progress_s = playhead_us / 1_000_000
+            right_text = (f"Current Song Progress: {fmt_mmss(progress_s)} / "
+                          f"{fmt_mmss(song.duration_sec)}")
+
+        self._set_filename_display(display_name)
+        # Cheap to call configure() with the same text repeatedly; Tk
+        # short-circuits when it hasn't changed.
+        self.right_label.configure(text=right_text)
+
+    def _active_channels_at(self, playhead_us: int) -> set[int]:
+        """Channels currently sounding at the playhead."""
+        song = self.master_app.song
+        if not song:
+            return set()
+        active: set[int] = set()
+        # Linear scan is fine for typical song sizes; if note counts get
+        # huge, swap for a binary search over starts + interval tree.
+        for start_us, end_us, ch in song.note_segments:
+            if start_us > playhead_us:
+                break
+            if end_us > playhead_us:
+                active.add(ch)
+        return active
+
+    def _draw_falling_notes(self,
+                            segments: list[tuple[int, int, int]],
+                            playhead_us: int,
+                            kb_top: int):
+        """
+        Note bars descend at VIS_FALL_PX_PER_SEC. A note's bottom edge
+        crosses kb_top at exactly its start_us. Bar height encodes its
+        duration. Only segments inside the visible window are drawn.
+        """
+        c = self.canvas
+        px_per_us = VIS_FALL_PX_PER_SEC / 1_000_000.0
+
+        # Visible time window: [playhead_us, playhead_us + lookahead]
+        lookahead_us = int(VIS_LOOKAHEAD_S * 1_000_000)
+        # Also include in-progress notes whose end is still ahead
+        # (their bottoms are below kb_top — they're "playing").
+
+        # Binary-search the first segment whose end is after playhead
+        # to skip the bulk of past notes cheaply.
+        # segments is sorted by start_us, but ends aren't monotonic;
+        # we still need to scan from the first plausible start.
+        starts = [s[0] for s in segments]
+        # Earliest start we'd care about: a note that started up to
+        # `lookahead` ago could still be on screen if it's long.
+        first_idx = bisect.bisect_left(starts, playhead_us - lookahead_us)
+        # And we stop once start > playhead + lookahead (note hasn't
+        # fallen into view yet).
+        last_start = playhead_us + lookahead_us
+
+        for i in range(first_idx, len(segments)):
+            start_us, end_us, ch = segments[i]
+            if start_us > last_start:
+                break
+            if end_us < playhead_us:
+                continue  # already finished
+
+            midi = ch + MIDI_NOTE_LOW
+            rect = self._key_rects.get(midi)
+            if rect is None:
+                continue
+
+            kx0, _, kx1, _ = rect
+
+            # Pixel positions: bar bottom at kb_top when start_us == playhead_us
+            bar_bottom = kb_top + (playhead_us - start_us) * px_per_us
+            bar_top    = kb_top + (playhead_us - end_us)   * px_per_us
+
+            # Skip if entirely off-screen
+            if bar_bottom < 0 or bar_top > kb_top:
+                continue
+
+            # Clamp the visible portion
+            draw_top    = max(0, bar_top)
+            draw_bottom = min(kb_top, bar_bottom)
+            if draw_bottom <= draw_top:
+                continue
+
+            # Visual style: green body with darker outline; if the note
+            # is currently playing (its bottom is at/below kb_top and
+            # top is above it... but we clip at kb_top), the bar will
+            # appear to "lock" at the keyboard — this matches the
+            # reference image where notes turn solid green at the line.
+            # Keep black-key notes a touch narrower for visual clarity.
+            inset = 2
+            x0 = kx0 + inset
+            x1 = kx1 - inset
+            if x1 - x0 < 2:
+                x0, x1 = kx0, kx1
+
+            c.create_rectangle(
+                x0, draw_top, x1, draw_bottom,
+                fill=VIS_NOTE_GREEN_BODY,
+                outline=VIS_NOTE_GREEN_OUTLINE,
+                width=1,
+            )
+
+    def _draw_keyboard(self, active_channels: set[int]):
+        c = self.canvas
+
+        # Pass 1: white keys
+        for midi in range(VIS_FIRST_MIDI, VIS_LAST_MIDI + 1):
+            if is_black_key(midi):
+                continue
+            rect = self._key_rects.get(midi)
+            if not rect:
+                continue
+            x0, y0, x1, y1 = rect
+            ch = midi - MIDI_NOTE_LOW
+            fill = VIS_KEY_ACTIVE if ch in active_channels else VIS_WHITE_KEY
+            c.create_rectangle(x0, y0, x1, y1,
+                               fill=fill, outline=VIS_KEY_BORDER, width=1)
+
+        # Pass 2: black keys (drawn on top)
+        for midi in range(VIS_FIRST_MIDI, VIS_LAST_MIDI + 1):
+            if not is_black_key(midi):
+                continue
+            rect = self._key_rects.get(midi)
+            if not rect:
+                continue
+            x0, y0, x1, y1 = rect
+            ch = midi - MIDI_NOTE_LOW
+            fill = VIS_KEY_ACTIVE if ch in active_channels else VIS_BLACK_KEY
+            c.create_rectangle(x0, y0, x1, y1,
+                               fill=fill, outline=VIS_KEY_BORDER, width=1)
+
+
+# ---------------------------------------------------------------------------
 # GUI Application
 # ---------------------------------------------------------------------------
 
@@ -867,7 +1461,7 @@ class SolenoidPianoApp(ctk.CTk):
         super().__init__()
 
         self.title("Solenoid Piano Controller")
-        self.geometry("1920x1080")
+        self.geometry("1100x820")
         self.minsize(750, 620)
 
         ctk.set_appearance_mode("light")
@@ -887,22 +1481,31 @@ class SolenoidPianoApp(ctk.CTk):
         self.folder_selected_color = "#F4B06A"
         self.folder_sort_field = "Filename"
         self.folder_sort_order = "A-Z"
-        self.song_source_path: Path | None = None
 
-        # MIDI visualiser state
-        self.visualiser_process: Any | None = None
-        self.visualiser_queue: Any | None = None
-        self.visualiser_loaded_path: Path | None = None
-        self.visualiser_filename = ""
-        self.visualiser_composer = ""
-        self.visualiser_duration_sec = 0.0
-        self.visualiser_start_monotonic: float | None = None
-        self.visualiser_paused_progress_sec = 0.0
-        self.visualiser_header_job = None
-        self.visualiser_temp_dir = tempfile.TemporaryDirectory(prefix="midi_vis_")
+        self._paused_song_us: int | None = None
+
+        # --- Playback clock state, exposed for the visualizer ------------
+        # Set when the worker sends CMD_START. Used together with
+        # playback_time_offset_us to compute the current song-time.
+        # Cleared (set to None) when not actively playing.
+        self.playback_start_monotonic: float | None = None
+        self.playback_time_offset_us: int = 0
 
         self._build_ui()
-        self._open_visualiser_on_startup()
+
+        # Visualizer window — created once, kept alive, hidden on close.
+        self.visualizer: VisualizerWindow | None = None
+        self.after(200, self._open_visualizer)
+
+    # -----------------------------------------------------------------------
+    # Visualizer plumbing
+    # -----------------------------------------------------------------------
+
+    def _open_visualizer(self):
+        if self.visualizer is None:
+            self.visualizer = VisualizerWindow(self)
+        else:
+            self.visualizer.show()
 
     # -----------------------------------------------------------------------
     # UI construction
@@ -910,26 +1513,18 @@ class SolenoidPianoApp(ctk.CTk):
 
     def _build_ui(self):
         self.tabview = ctk.CTkTabview(self, fg_color=WINDOW_BG)
-        # Keep tab-highlight customization compatible across CTk versions.
         try:
             self.tabview.configure(
                 segmented_button_selected_color=ACCENT,
                 segmented_button_selected_hover_color=ACCENT_HOVER,
             )
         except Exception:
-            try:
-                self.tabview._segmented_button.configure(
-                    selected_color=ACCENT,
-                    selected_hover_color=ACCENT_HOVER,
-                )
-            except Exception:
-                pass
+            pass
         self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
 
         self.player_tab = self.tabview.add("Single Song")
         self.folder_tab = self.tabview.add("Folder View")
 
-        # Trigger folder re-parse whenever Folder View is entered.
         try:
             self.tabview.configure(command=self._on_tab_changed)
         except Exception:
@@ -939,7 +1534,6 @@ class SolenoidPianoApp(ctk.CTk):
         self._build_folder_tab(self.folder_tab)
 
     def _build_single_song_tab(self, parent):
-        # --- File selection ------------------------------------------------
         file_frame = ctk.CTkFrame(parent, fg_color=SECTION_BG)
         file_frame.pack(fill="x", padx=15, pady=(15, 5))
 
@@ -959,7 +1553,12 @@ class SolenoidPianoApp(ctk.CTk):
             command=self._browse_file)
         self.browse_btn.pack(side="right", padx=10, pady=10)
 
-        # --- Song info -----------------------------------------------------
+        self.show_vis_btn = ctk.CTkButton(
+            file_frame, text="Show Visualizer", width=130,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            command=self._open_visualizer)
+        self.show_vis_btn.pack(side="right", padx=10, pady=10)
+
         self.info_frame = ctk.CTkFrame(parent, fg_color=SECTION_BG)
         self.info_frame.pack(fill="x", padx=15, pady=5)
 
@@ -977,7 +1576,6 @@ class SolenoidPianoApp(ctk.CTk):
             self.info_labels[key] = lbl
             info_inner.columnconfigure(col * 2 + 1, weight=1)
 
-        # --- Event list ----------------------------------------------------
         event_frame = ctk.CTkFrame(parent, fg_color=SECTION_BG)
         event_frame.pack(fill="both", expand=True, padx=15, pady=5)
 
@@ -995,7 +1593,6 @@ class SolenoidPianoApp(ctk.CTk):
             state="disabled")
         self.event_textbox.pack(fill="both", expand=True, padx=5, pady=(2, 8))
 
-        # --- Serial / transmit ---------------------------------------------
         serial_frame = ctk.CTkFrame(parent, fg_color=SECTION_BG)
         serial_frame.pack(fill="x", padx=15, pady=5)
 
@@ -1005,7 +1602,6 @@ class SolenoidPianoApp(ctk.CTk):
         ctk.CTkLabel(serial_inner, text="Serial Port:",
                      font=ctk.CTkFont(size=13)).pack(side="left", padx=(0, 5))
 
-        # Combo box dropdown button
         self.port_combo = ctk.CTkComboBox(
             serial_inner, width=280, values=["(click refresh)"],
             button_color=ACCENT, button_hover_color=ACCENT_HOVER,
@@ -1028,14 +1624,12 @@ class SolenoidPianoApp(ctk.CTk):
         self.baud_combo.set("115200")
         self.baud_combo.pack(side="left", padx=5)
 
-        # --- Action buttons ------------------------------------------------
         btn_frame = ctk.CTkFrame(parent, fg_color=SECTION_BG)
         btn_frame.pack(fill="x", padx=15, pady=5)
 
         btn_inner = ctk.CTkFrame(btn_frame, fg_color="transparent")
         btn_inner.pack(pady=8)
 
-        # Upload & Play button
         self.transmit_btn = ctk.CTkButton(
             btn_inner, text="Upload & Play", width=150, height=40,
             font=ctk.CTkFont(size=14, weight="bold"),
@@ -1050,12 +1644,10 @@ class SolenoidPianoApp(ctk.CTk):
             command=self._send_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=10)
 
-        # --- Progress bar --------------------------------------------------
         self.progress = ctk.CTkProgressBar(parent, progress_color=ACCENT)
         self.progress.pack(fill="x", padx=15, pady=(2, 5))
         self.progress.set(0)
 
-        # --- Note test terminal --------------------------------------------
         test_frame = ctk.CTkFrame(parent, fg_color=SECTION_BG)
         test_frame.pack(fill="x", padx=15, pady=5)
 
@@ -1101,7 +1693,6 @@ class SolenoidPianoApp(ctk.CTk):
 
         self.note_entry.bind("<Return>", lambda e: self._test_note())
 
-        # --- Status bar ----------------------------------------------------
         self.status_label = ctk.CTkLabel(
             parent, text="Ready — load a MIDI file to begin",
             font=ctk.CTkFont(size=12), anchor="w")
@@ -1110,7 +1701,6 @@ class SolenoidPianoApp(ctk.CTk):
         self._refresh_ports()
 
     def _build_folder_tab(self, parent):
-        # --- Folder selection header --------------------------------------
         folder_frame = ctk.CTkFrame(parent, fg_color=SECTION_BG)
         folder_frame.pack(fill="x", padx=15, pady=(15, 5))
 
@@ -1130,7 +1720,6 @@ class SolenoidPianoApp(ctk.CTk):
             command=self._browse_folder)
         self.folder_browse_btn.pack(side="right", padx=10, pady=10)
 
-        # --- MIDI file grid container -------------------------------------
         grid_frame = ctk.CTkFrame(parent, fg_color=SECTION_BG)
         grid_frame.pack(fill="both", expand=True, padx=15, pady=5)
 
@@ -1214,7 +1803,6 @@ class SolenoidPianoApp(ctk.CTk):
         self.song_tiles: list[ctk.CTkFrame] = []
         self.song_rows: list[ctk.CTkFrame] = []
 
-        # --- Selection overlay (hidden until a song is selected) ---------
         self.folder_overlay = ctk.CTkFrame(parent, fg_color=SECTION_BG)
 
         overlay_top = ctk.CTkFrame(self.folder_overlay, fg_color="transparent")
@@ -1332,7 +1920,7 @@ class SolenoidPianoApp(ctk.CTk):
             return None
 
         i = 2 if len(name) > 1 and name[1] in ('#', 'b') else 1
-        note_part  = name[:i].upper()
+        note_part   = name[:i].upper()
         octave_part = name[i:]
 
         note_map = {
@@ -1387,7 +1975,6 @@ class SolenoidPianoApp(ctk.CTk):
             text="Scanning MIDI files...",
             text_color="black",
         )
-
         self._request_folder_reparse(folder_path)
 
     def _parse_folder_songs(self, folder_path: Path) -> list[tuple[Path, SongData | None]]:
@@ -1403,7 +1990,6 @@ class SolenoidPianoApp(ctk.CTk):
             except Exception:
                 song = None
             songs_with_meta.append((midi_file, song))
-
         return songs_with_meta
 
     def _request_folder_reparse(self, folder_path: Path):
@@ -1509,170 +2095,6 @@ class SolenoidPianoApp(ctk.CTk):
         self.folder_progress.set(0)
         self._set_folder_overlay_visible(True)
 
-    def _start_folder_transmit(self):
-        if self.selected_folder_song is None:
-            messagebox.showwarning("No Song Selected", "Select a parsed song first.")
-            return
-
-        if self.selected_folder_song_path is None:
-            messagebox.showwarning("No Source File",
-                                   "Please re-select the song before transmitting.")
-            return
-
-        port_str = self.folder_port_combo.get()
-        if "No ports" in port_str or "click refresh" in port_str:
-            messagebox.showwarning("No Port",
-                                   "Select a serial port first.\n"
-                                   "Click Refresh to scan for devices.")
-            return
-
-        if self.is_transmitting:
-            return
-
-        port = extract_port_name(port_str)
-        baud = int(self.folder_baud_combo.get())
-        song = self.selected_folder_song
-
-        self.is_transmitting = True
-        self.folder_transmit_btn.configure(state="disabled")
-        self.folder_stop_btn.configure(state="normal")
-        self.folder_browse_btn.configure(state="disabled")
-        self.folder_progress.set(0)
-
-        self._open_visualiser_window(self.selected_folder_song_path, song)
-
-        threading.Thread(target=self._transmit_worker_folder,
-                         args=(port, baud, song, self.selected_folder_song_path),
-                         daemon=True).start()
-
-    def _transmit_worker_folder(self, port: str, baud: int,
-                                song: SongData, song_path: Path):
-        ser: serial.Serial | None = None
-        try:
-            self._set_folder_status_safe(f"Connecting to {port}...")
-            ser = serial.Serial(port, baud, timeout=ACK_TIMEOUT_S)
-            time.sleep(POST_OPEN_SETTLE_S)
-            drain_input(ser)
-
-            self._set_folder_status_safe("Pinging MCU...")
-            send_packet(ser, build_command_packet(CMD_PING))
-            free = wait_for_ack(ser)
-            if free is None:
-                self._show_error_safe("Connection Failed",
-                                      "No response from MCU.")
-                return
-
-            send_packet(ser, build_command_packet(CMD_STOP))
-            free = wait_for_ack(ser)
-            if free is None:
-                self._show_error_safe("Transmission Error",
-                                      "Failed to clear old events before upload.")
-                return
-
-            total = song.num_events
-            sent = 0
-            started = False
-
-            while sent < total:
-                if not self.is_transmitting:
-                    self._set_folder_status_safe("Transmission cancelled.")
-                    send_packet(ser, build_command_packet(CMD_STOP))
-                    return
-
-                batch = song.events[sent:sent + BATCH_SIZE]
-                batch_len = len(batch)
-
-                while free < batch_len:
-                    if not self.is_transmitting:
-                        self._set_folder_status_safe("Transmission cancelled.")
-                        send_packet(ser, build_command_packet(CMD_STOP))
-                        return
-                    time.sleep(BACKPRESSURE_POLL_S)
-                    send_packet(ser, build_command_packet(CMD_PING))
-                    free = wait_for_ack(ser)
-                    if free is None:
-                        self._show_error_safe("Transmission Error",
-                                              "Lost contact with MCU during streaming.")
-                        send_packet(ser, build_command_packet(CMD_STOP))
-                        return
-
-                send_packet(ser, build_batch_packet(batch))
-                free = wait_for_ack(ser)
-                if free is None:
-                    self._show_error_safe("Transmission Error",
-                                          f"Lost ACK at event {sent + batch_len}.")
-                    send_packet(ser, build_command_packet(CMD_STOP))
-                    return
-
-                sent += batch_len
-                self._update_folder_progress_safe(sent / total)
-
-                if not started and (sent >= BATCH_SIZE * PRIME_BATCHES or sent >= total):
-                    # Start the visualiser immediately before START so it stays
-                    # aligned with when the MCU begins playback.
-                    self._start_visualiser_playback(song, song_path)
-                    time.sleep(VISUALISER_START_LEAD_S)
-                    send_packet(ser, build_command_packet(CMD_START))
-                    if wait_for_ack(ser) is None:
-                        self._pause_visualiser_playback()
-                        self._show_error_safe("Playback Error", "No ACK for START.")
-                        return
-                    started = True
-                    self._set_folder_status_safe(
-                        f"Streaming & playing: {sent:,}/{total:,} events")
-                else:
-                    prefix = "Streaming" if started else "Priming"
-                    self._set_folder_status_safe(f"{prefix}: {sent:,}/{total:,} events")
-
-                time.sleep(INTER_BATCH_DELAY_S)
-
-            send_packet(ser, build_command_packet(CMD_EOS))
-            wait_for_ack(ser)
-
-            if not started:
-                self._start_visualiser_playback(song, song_path)
-                time.sleep(VISUALISER_START_LEAD_S)
-                send_packet(ser, build_command_packet(CMD_START))
-                if wait_for_ack(ser) is None:
-                    self._pause_visualiser_playback()
-                    self._show_error_safe("Playback Error", "No ACK for START.")
-                    return
-
-            self._update_folder_progress_safe(1.0)
-            self._set_folder_status_safe(
-                f"Playing: {song.filename} ({song.duration_sec:.1f}s, {song.tempo_bpm:.0f} BPM)")
-
-        except serial.SerialException as e:
-            self._show_error_safe("Serial Error", str(e))
-        except Exception as e:
-            self._show_error_safe("Error", str(e))
-        finally:
-            if ser is not None:
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-            self._finish_folder_transmit_safe()
-
-    def _send_folder_stop(self):
-        self.is_transmitting = False
-        self._pause_visualiser_playback()
-        ser: serial.Serial | None = None
-        try:
-            port = extract_port_name(self.folder_port_combo.get())
-            baud = int(self.folder_baud_combo.get())
-            ser = serial.Serial(port, baud, timeout=1)
-            send_packet(ser, build_command_packet(CMD_STOP))
-            self._set_folder_status_safe("Stop command sent.")
-        except Exception as e:
-            self._set_folder_status_safe(f"Stop failed: {e}")
-        finally:
-            if ser is not None:
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-
     def _set_folder_view_mode(self, mode: str):
         if mode not in ("grid", "list"):
             return
@@ -1751,7 +2173,6 @@ class SolenoidPianoApp(ctk.CTk):
 
     def _render_folder_files(self, songs_with_meta: list[tuple[Path, SongData | None]]):
         folder_path = self.current_folder_path
-
         if folder_path is None:
             return
 
@@ -1773,10 +2194,11 @@ class SolenoidPianoApp(ctk.CTk):
             text_color="black",
         )
 
+        sorted_songs = self._get_sorted_folder_songs(songs_with_meta)
         if self.folder_view_mode == "list":
-            self._populate_song_list(self._get_sorted_folder_songs(songs_with_meta))
+            self._populate_song_list(sorted_songs)
         else:
-            self._populate_song_grid(self._get_sorted_folder_songs(songs_with_meta))
+            self._populate_song_grid(sorted_songs)
 
         if self.selected_folder_song_path and self.selected_folder_song_path in self.folder_item_widgets:
             selected_song = None
@@ -1866,7 +2288,6 @@ class SolenoidPianoApp(ctk.CTk):
             name_label.place(relx=0.5, rely=0.5, anchor="center")
 
             self._bind_song_click([tile, name_label], midi_file, song, "#FFDAB3")
-
             self.song_tiles.append(tile)
 
     def _populate_song_list(self, songs_with_meta: list[tuple[Path, SongData | None]]):
@@ -1876,49 +2297,18 @@ class SolenoidPianoApp(ctk.CTk):
             corner_radius=8,
         )
         header.pack(fill="x", padx=8, pady=(4, 6))
-        header.grid_columnconfigure(0, weight=6)
-        header.grid_columnconfigure(1, weight=2)
-        header.grid_columnconfigure(2, weight=2)
-        header.grid_columnconfigure(3, weight=2)
-        header.grid_columnconfigure(4, weight=2)
-        header.grid_columnconfigure(5, weight=3)
+        for i, wt in enumerate([6, 2, 2, 2, 2, 3]):
+            header.grid_columnconfigure(i, weight=wt)
 
-        ctk.CTkLabel(
-            header,
-            text="Filename",
-            anchor="w",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=0, column=0, padx=10, pady=8, sticky="w")
-        ctk.CTkLabel(
-            header,
-            text="Composer",
-            anchor="w",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=0, column=1, padx=10, pady=8, sticky="w")
-        ctk.CTkLabel(
-            header,
-            text="Duration",
-            anchor="e",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=0, column=2, padx=10, pady=8, sticky="e")
-        ctk.CTkLabel(
-            header,
-            text="Events",
-            anchor="e",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=0, column=3, padx=10, pady=8, sticky="e")
-        ctk.CTkLabel(
-            header,
-            text="Tempo",
-            anchor="e",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=0, column=4, padx=10, pady=8, sticky="e")
-        ctk.CTkLabel(
-            header,
-            text="Key Range",
-            anchor="w",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        ).grid(row=0, column=5, padx=10, pady=8, sticky="w")
+        columns = ["Filename", "Composer", "Duration", "Events", "Tempo", "Key Range"]
+        anchors = ["w", "w", "e", "e", "e", "w"]
+        for i, col in enumerate(columns):
+            ctk.CTkLabel(
+                header,
+                text=col,
+                anchor=anchors[i],
+                font=ctk.CTkFont(size=12, weight="bold"),
+            ).grid(row=0, column=i, padx=10, pady=8, sticky=anchors[i])
         self.song_rows.append(header)
 
         for i, (midi_file, song) in enumerate(songs_with_meta, start=1):
@@ -1930,12 +2320,8 @@ class SolenoidPianoApp(ctk.CTk):
                 border_color="#E3B27A",
             )
             row.pack(fill="x", padx=8, pady=4)
-            row.grid_columnconfigure(0, weight=6)
-            row.grid_columnconfigure(1, weight=2)
-            row.grid_columnconfigure(2, weight=2)
-            row.grid_columnconfigure(3, weight=2)
-            row.grid_columnconfigure(4, weight=2)
-            row.grid_columnconfigure(5, weight=3)
+            for j, wt in enumerate([6, 2, 2, 2, 2, 3]):
+                row.grid_columnconfigure(j, weight=wt)
 
             if song is None:
                 composer_text = ""
@@ -1952,51 +2338,21 @@ class SolenoidPianoApp(ctk.CTk):
                     key_range_text = f"{low} - {high}"
                 else:
                     key_range_text = "--"
-
                 duration_text = f"{song.duration_sec:.2f}s"
                 events_text = f"{song.num_events:,}"
                 tempo_text = f"{song.tempo_bpm:.0f} BPM"
 
-            ctk.CTkLabel(
-                row,
-                text=midi_file.name,
-                anchor="w",
-                font=ctk.CTkFont(size=12, weight="bold"),
-            ).grid(row=0, column=0, padx=10, pady=8, sticky="w")
-            ctk.CTkLabel(
-                row,
-                text=composer_text,
-                anchor="w",
-                font=ctk.CTkFont(size=12),
-            ).grid(row=0, column=1, padx=10, pady=8, sticky="w")
-            ctk.CTkLabel(
-                row,
-                text=duration_text,
-                anchor="e",
-                font=ctk.CTkFont(size=12),
-            ).grid(row=0, column=2, padx=10, pady=8, sticky="e")
-            ctk.CTkLabel(
-                row,
-                text=events_text,
-                anchor="e",
-                font=ctk.CTkFont(size=12),
-            ).grid(row=0, column=3, padx=10, pady=8, sticky="e")
-            ctk.CTkLabel(
-                row,
-                text=tempo_text,
-                anchor="e",
-                font=ctk.CTkFont(size=12),
-            ).grid(row=0, column=4, padx=10, pady=8, sticky="e")
-            ctk.CTkLabel(
-                row,
-                text=key_range_text,
-                anchor="w",
-                font=ctk.CTkFont(size=12),
-            ).grid(row=0, column=5, padx=10, pady=8, sticky="w")
+            values = [midi_file.name, composer_text, duration_text, events_text, tempo_text, key_range_text]
+            anchors = ["w", "w", "e", "e", "e", "w"]
+            for j, val in enumerate(values):
+                ctk.CTkLabel(
+                    row,
+                    text=val,
+                    anchor=anchors[j],
+                    font=ctk.CTkFont(size=12, weight="bold" if j == 0 else "normal"),
+                ).grid(row=0, column=j, padx=10, pady=8, sticky=anchors[j])
 
-            row_widgets = [row]
-            for child in row.winfo_children():
-                row_widgets.append(child)
+            row_widgets = [row] + list(row.winfo_children())
             self._bind_song_click(row_widgets, midi_file, song,
                                   "#FFDAB3" if i % 2 else "#FCE7CF")
 
@@ -2019,8 +2375,16 @@ class SolenoidPianoApp(ctk.CTk):
             self._set_status("Error parsing file.")
             return
 
-        self.song_source_path = Path(path)
-        self.file_label.configure(text=Path(path).name, text_color=ACCENT, font=ctk.CTkFont(size=13, weight="bold"))
+        self._paused_song_us = None
+        # Reset playback clock state so visualizer shows song at t=0
+        self.playback_start_monotonic = None
+        self.playback_time_offset_us = 0
+
+        self.file_label.configure(
+            text=Path(path).name,
+            text_color=ACCENT,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
         self._update_song_info()
         self._populate_event_list()
         self.transmit_btn.configure(state="normal")
@@ -2088,11 +2452,6 @@ class SolenoidPianoApp(ctk.CTk):
             messagebox.showwarning("No Data", "Load a MIDI file first.")
             return
 
-        if self.song_source_path is None:
-            messagebox.showwarning("No Source File",
-                                   "Please re-load the MIDI file before transmitting.")
-            return
-
         port_str = self.port_combo.get()
         if "No ports" in port_str or "click refresh" in port_str:
             messagebox.showwarning("No Port",
@@ -2103,38 +2462,200 @@ class SolenoidPianoApp(ctk.CTk):
         port = extract_port_name(port_str)
         baud = int(self.baud_combo.get())
 
+        if self._paused_song_us is not None:
+            timestamps = [e.timestamp_us for e in self.song.events]
+            start_index = bisect.bisect_left(timestamps, self._paused_song_us)
+            if start_index >= len(self.song.events):
+                start_index = 0
+                time_offset_us = 0
+            else:
+                time_offset_us = self._paused_song_us
+        else:
+            start_index = 0
+            time_offset_us = 0
+
+        self._paused_song_us = None
+
         self.is_transmitting = True
         self.transmit_btn.configure(state="disabled")
         self.browse_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress.set(0)
 
-        self._open_visualiser_window(self.song_source_path, self.song)
+        # Pre-set the offset so the visualizer header reflects our start
+        # point even before CMD_START fires.
+        self.playback_time_offset_us = time_offset_us
+        self.playback_start_monotonic = None  # set when CMD_START is sent
 
-        threading.Thread(target=self._transmit_worker,
-                         args=(port, baud), daemon=True).start()
+        threading.Thread(
+            target=self._transmit_worker,
+            args=(port, baud, start_index, time_offset_us),
+            daemon=True,
+        ).start()
 
-    def _transmit_worker(self, port: str, baud: int):
-        """
-        Streaming upload:
-          1. Ping + clear ring.
-          2. Prime the ring with PRIME_BATCHES worth of events.
-          3. Send CMD_START — playback begins using what we've primed.
-          4. Keep feeding batches. Every ACK tells us the current free-slot
-             count; if a batch wouldn't fit, we poll with PING until room
-             opens up (back-pressure).
-          5. When all events are sent, send CMD_EOS so the firmware knows
-             to stop when the ring finally drains.
-        """
+    def _start_folder_transmit(self):
+        if self.selected_folder_song is None:
+            messagebox.showwarning("No Song Selected", "Select a parsed song first.")
+            return
+
+        port_str = self.folder_port_combo.get()
+        if "No ports" in port_str or "click refresh" in port_str:
+            messagebox.showwarning("No Port",
+                                   "Select a serial port first.\n"
+                                   "Click Refresh to scan for devices.")
+            return
+
+        if self.is_transmitting:
+            return
+
+        port = extract_port_name(port_str)
+        baud = int(self.folder_baud_combo.get())
+        song = self.selected_folder_song
+
+        self.song = song
+        self._paused_song_us = None
+        self.playback_time_offset_us = 0
+        self.playback_start_monotonic = None
+
+        self.is_transmitting = True
+        self.folder_transmit_btn.configure(state="disabled")
+        self.folder_stop_btn.configure(state="normal")
+        self.folder_browse_btn.configure(state="disabled")
+        self.folder_progress.set(0)
+
+        threading.Thread(target=self._transmit_worker_folder,
+                         args=(port, baud, song), daemon=True).start()
+
+    def _transmit_worker_folder(self, port: str, baud: int, song: SongData):
         ser: serial.Serial | None = None
+        try:
+            self._set_folder_status_safe(f"Connecting to {port}...")
+            ser = serial.Serial(port, baud, timeout=ACK_TIMEOUT_S)
+            time.sleep(POST_OPEN_SETTLE_S)
+            drain_input(ser)
+
+            self._set_folder_status_safe("Pinging MCU...")
+            send_packet(ser, build_command_packet(CMD_PING))
+            free = wait_for_ack(ser)
+            if free is None:
+                self._show_error_safe("Connection Failed", "No response from MCU.")
+                return
+
+            send_packet(ser, build_command_packet(CMD_STOP))
+            free = wait_for_ack(ser)
+            if free is None:
+                self._show_error_safe("Transmission Error",
+                                      "Failed to clear old events before upload.")
+                return
+
+            total = song.num_events
+            sent = 0
+            started = False
+
+            while sent < total:
+                if not self.is_transmitting:
+                    self._set_folder_status_safe("Transmission cancelled.")
+                    send_packet(ser, build_command_packet(CMD_STOP))
+                    return
+
+                batch = song.events[sent:sent + BATCH_SIZE]
+                batch_len = len(batch)
+
+                while free < batch_len:
+                    if not self.is_transmitting:
+                        self._set_folder_status_safe("Transmission cancelled.")
+                        send_packet(ser, build_command_packet(CMD_STOP))
+                        return
+                    time.sleep(BACKPRESSURE_POLL_S)
+                    send_packet(ser, build_command_packet(CMD_PING))
+                    free = wait_for_ack(ser)
+                    if free is None:
+                        self._show_error_safe("Transmission Error",
+                                              "Lost contact with MCU during streaming.")
+                        send_packet(ser, build_command_packet(CMD_STOP))
+                        return
+
+                send_packet(ser, build_batch_packet(batch))
+                free = wait_for_ack(ser)
+                if free is None:
+                    self._show_error_safe("Transmission Error",
+                                          f"Lost ACK at event {sent + batch_len}.")
+                    send_packet(ser, build_command_packet(CMD_STOP))
+                    return
+
+                sent += batch_len
+                self._update_folder_progress_safe(sent / max(1, total))
+
+                if not started and (sent >= BATCH_SIZE * PRIME_BATCHES or sent >= total):
+                    send_packet(ser, build_command_packet(CMD_START))
+                    if wait_for_ack(ser) is None:
+                        self._show_error_safe("Playback Error", "No ACK for START.")
+                        return
+                    started = True
+                    self.playback_time_offset_us = 0
+                    self.playback_start_monotonic = time.monotonic()
+                    self._set_folder_status_safe(
+                        f"Streaming & playing: {sent:,}/{total:,} events")
+                else:
+                    prefix = "Streaming" if started else "Priming"
+                    self._set_folder_status_safe(f"{prefix}: {sent:,}/{total:,} events")
+
+                time.sleep(INTER_BATCH_DELAY_S)
+
+            send_packet(ser, build_command_packet(CMD_EOS))
+            wait_for_ack(ser)
+
+            if not started:
+                send_packet(ser, build_command_packet(CMD_START))
+                wait_for_ack(ser)
+                self.playback_time_offset_us = 0
+                self.playback_start_monotonic = time.monotonic()
+
+            self._update_folder_progress_safe(1.0)
+            self._set_folder_status_safe(
+                f"Playing: {song.filename} ({song.duration_sec:.1f}s, {song.tempo_bpm:.0f} BPM)")
+
+        except serial.SerialException as e:
+            self._show_error_safe("Serial Error", str(e))
+        except Exception as e:
+            self._show_error_safe("Error", str(e))
+        finally:
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+            self._finish_folder_transmit_safe()
+
+    def _transmit_worker(self, port: str, baud: int,
+                          start_index: int = 0, time_offset_us: int = 0):
+        ser: serial.Serial | None = None
+
+        def current_song_position_us() -> int:
+            if self.playback_start_monotonic is None:
+                return time_offset_us
+            elapsed_us = int(
+                (time.monotonic() - self.playback_start_monotonic) * 1_000_000)
+            return time_offset_us + elapsed_us
+
+        def handle_stop():
+            pos = current_song_position_us()
+            self._paused_song_us = pos
+            try:
+                send_packet(ser, build_command_packet(CMD_STOP))
+                wait_for_ack(ser)
+            except Exception:
+                pass
+            self._set_status_safe(
+                f"Stopped at {pos / 1_000_000:.2f}s — "
+                f"press Upload & Play to resume")
+
         try:
             self._set_status_safe(f"Connecting to {port}...")
             ser = serial.Serial(port, baud, timeout=ACK_TIMEOUT_S)
             time.sleep(POST_OPEN_SETTLE_S)
-            drain_input(ser)  # dump any boot-time garbage from the R4
+            drain_input(ser)
 
-            # --- Handshake ------------------------------------------------
-            self._set_status_safe("Pinging MCU...")
             send_packet(ser, build_command_packet(CMD_PING))
             free = wait_for_ack(ser)
             if free is None:
@@ -2147,36 +2668,39 @@ class SolenoidPianoApp(ctk.CTk):
                     "• The MCU firmware is running")
                 return
 
-            # Clear any old events still in the ring.
             send_packet(ser, build_command_packet(CMD_STOP))
             free = wait_for_ack(ser)
             if free is None:
                 self._show_error_safe("Transmission Error",
-                                      "Failed to clear old events before upload.")
+                                      "Failed to clear MCU before upload.")
                 return
 
-            total   = self.song.num_events
-            sent    = 0
+            total = self.song.num_events
+            sent  = start_index
             started = False
 
             while sent < total:
                 if not self.is_transmitting:
-                    self._set_status_safe("Transmission cancelled.")
-                    send_packet(ser, build_command_packet(CMD_STOP))
+                    handle_stop()
                     return
 
-                batch     = self.song.events[sent:sent + BATCH_SIZE]
+                raw_batch = self.song.events[sent:sent + BATCH_SIZE]
+
+                if time_offset_us > 0:
+                    batch = [SolenoidEvent(
+                        timestamp_us=max(0, ev.timestamp_us - time_offset_us),
+                        channel=ev.channel,
+                        event_type=ev.event_type,
+                        velocity=ev.velocity,
+                    ) for ev in raw_batch]
+                else:
+                    batch = raw_batch
+
                 batch_len = len(batch)
 
-                # --- Back-pressure: wait for room in the firmware ring ---
-                # The firmware reports free_slots on every ACK. If it's
-                # less than our next batch size, poll with PING until room
-                # opens up. This is cheap: a PING round-trip is ~1 ms and
-                # only happens once playback has caught up with upload.
                 while free < batch_len:
                     if not self.is_transmitting:
-                        self._set_status_safe("Transmission cancelled.")
-                        send_packet(ser, build_command_packet(CMD_STOP))
+                        handle_stop()
                         return
                     time.sleep(BACKPRESSURE_POLL_S)
                     send_packet(ser, build_command_packet(CMD_PING))
@@ -2185,10 +2709,8 @@ class SolenoidPianoApp(ctk.CTk):
                         self._show_error_safe(
                             "Transmission Error",
                             "Lost contact with MCU during streaming.")
-                        send_packet(ser, build_command_packet(CMD_STOP))
                         return
 
-                # --- Send the batch -------------------------------------
                 send_packet(ser, build_batch_packet(batch))
                 free = wait_for_ack(ser)
                 if free is None:
@@ -2199,62 +2721,61 @@ class SolenoidPianoApp(ctk.CTk):
                         "• Firmware is printing debug text that "
                         "desyncs the protocol\n"
                         "• USB cable or connection issue")
-                    send_packet(ser, build_command_packet(CMD_STOP))
                     return
 
                 sent += batch_len
-                self._update_progress_safe(sent / total)
+                denom = max(1, total - start_index)
+                self._update_progress_safe((sent - start_index) / denom)
 
-                # --- Kick off playback once we've primed the ring --------
-                # We prime with a couple of batches' worth of events so
-                # the playback engine has a head start before serial
-                # throughput has to keep up with real time.
-                if not started and (sent >= BATCH_SIZE * PRIME_BATCHES or
-                                    sent >= total):
-                    # Start the visualiser immediately before START so it stays
-                    # aligned with when the MCU begins playback.
-                    self._start_visualiser_playback()
-                    time.sleep(VISUALISER_START_LEAD_S)
+                if not started and (
+                    (sent - start_index) >= BATCH_SIZE * PRIME_BATCHES
+                    or sent >= total
+                ):
                     send_packet(ser, build_command_packet(CMD_START))
                     if wait_for_ack(ser) is None:
-                        self._pause_visualiser_playback()
                         self._show_error_safe("Playback Error",
                                               "No ACK for START.")
                         return
                     started = True
+                    # Publish playback clock — visualizer reads this.
+                    self.playback_start_monotonic = time.monotonic()
                     self._set_status_safe(
                         f"Streaming & playing: {sent:,}/{total:,} events")
                 else:
-                    status_prefix = "Streaming" if started else "Priming"
+                    prefix = "Streaming" if started else "Priming"
                     self._set_status_safe(
-                        f"{status_prefix}: {sent:,}/{total:,} events")
+                        f"{prefix}: {sent:,}/{total:,} events")
 
-                # Small breather so the MCU can drain its ingest queue.
                 time.sleep(INTER_BATCH_DELAY_S)
 
-            # --- All events uploaded --------------------------------------
-            # Tell the firmware no more events are coming so it can end
-            # playback after the ring finally drains.
             send_packet(ser, build_command_packet(CMD_EOS))
             wait_for_ack(ser)
 
-            # Edge case: very short song never met the prime threshold
-            # (e.g. <2 batches total), so we never sent START.
             if not started:
-                self._start_visualiser_playback()
-                time.sleep(VISUALISER_START_LEAD_S)
                 send_packet(ser, build_command_packet(CMD_START))
-                if wait_for_ack(ser) is None:
-                    self._pause_visualiser_playback()
-                    self._show_error_safe("Playback Error",
-                                          "No ACK for START.")
-                    return
+                wait_for_ack(ser)
+                started = True
+                self.playback_start_monotonic = time.monotonic()
 
             self._update_progress_safe(1.0)
             self._set_status_safe(
                 f"Playing: {self.song.filename} "
                 f"({self.song.duration_sec:.1f}s, "
                 f"{self.song.tempo_bpm:.0f} BPM)")
+
+            song_remaining_us = self.song.duration_us - time_offset_us
+            deadline = (self.playback_start_monotonic
+                        + song_remaining_us / 1_000_000
+                        + 0.5)
+
+            while time.monotonic() < deadline:
+                if not self.is_transmitting:
+                    handle_stop()
+                    return
+                time.sleep(0.1)
+
+            self._paused_song_us = None
+            self._set_status_safe(f"Finished: {self.song.filename}")
 
         except serial.SerialException as e:
             self._show_error_safe("Serial Error", str(e))
@@ -2269,6 +2790,11 @@ class SolenoidPianoApp(ctk.CTk):
             self._finish_transmit_safe()
 
     def _test_note(self):
+        if self.is_transmitting:
+            self._set_status("Can't test a note while a song is playing — "
+                             "stop the song first.")
+            return
+
         note_text = self.note_entry.get().strip()
         if not note_text:
             self._set_status("Enter a note name (e.g. C4, A0, G#5)")
@@ -2342,8 +2868,6 @@ class SolenoidPianoApp(ctk.CTk):
             send_packet(ser, build_command_packet(CMD_START))
             wait_for_ack(ser)
 
-            # For a test note, tell the firmware the "stream" is done so
-            # playback cleanly stops after the OFF fires.
             send_packet(ser, build_command_packet(CMD_EOS))
             wait_for_ack(ser)
 
@@ -2361,256 +2885,69 @@ class SolenoidPianoApp(ctk.CTk):
                     pass
 
     def _send_stop(self):
+        if not self.is_transmitting:
+            return
         self.is_transmitting = False
-        self._pause_visualiser_playback()
-        ser: serial.Serial | None = None
-        try:
-            port = extract_port_name(self.port_combo.get())
-            baud = int(self.baud_combo.get())
-            ser  = serial.Serial(port, baud, timeout=1)
-            send_packet(ser, build_command_packet(CMD_STOP))
-            self._set_status("Stop command sent.")
-        except Exception as e:
-            self._set_status(f"Stop failed: {e}")
-        finally:
-            if ser is not None:
-                try:
-                    ser.close()
-                except Exception:
-                    pass
+        self.stop_btn.configure(state="disabled")
+        self._set_status("Stopping...")
+
+    def _send_folder_stop(self):
+        if not self.is_transmitting:
+            return
+        self.is_transmitting = False
+        self.folder_stop_btn.configure(state="disabled")
+        self._set_folder_status_safe("Stopping...")
 
     # -----------------------------------------------------------------------
-    # Thread-safe GUI helpers
+    # Thread-safe UI helpers
     # -----------------------------------------------------------------------
 
     def _set_status_safe(self, text: str):
-        self.after(0, self._set_status, text)
+        self.after(0, lambda: self.status_label.configure(text=text))
 
-    def _update_progress_safe(self, value: float):
-        self.after(0, self.progress.set, value)
+    def _update_progress_safe(self, fraction: float):
+        f = max(0.0, min(1.0, fraction))
+        self.after(0, lambda: self.progress.set(f))
 
     def _show_error_safe(self, title: str, message: str):
-        self.after(0, messagebox.showerror, title, message)
-
-    def _show_warning_safe(self, title: str, message: str):
-        self.after(0, messagebox.showwarning, title, message)
+        self.after(0, lambda: messagebox.showerror(title, message))
 
     def _set_folder_status_safe(self, text: str):
-        self.after(0, self.folder_overlay_status.configure, {"text": text})
+        if hasattr(self, "folder_overlay_status"):
+            self.after(0, lambda: self.folder_overlay_status.configure(text=text))
 
     def _update_folder_progress_safe(self, value: float):
-        self.after(0, self.folder_progress.set, value)
+        if hasattr(self, "folder_progress"):
+            f = max(0.0, min(1.0, value))
+            self.after(0, lambda: self.folder_progress.set(f))
 
     def _finish_folder_transmit_safe(self):
         def _finish():
             self.is_transmitting = False
-            self.folder_transmit_btn.configure(
-                state="normal" if self.selected_folder_song is not None else "disabled")
-            self.folder_stop_btn.configure(state="disabled")
-            self.folder_browse_btn.configure(state="normal")
+            self.playback_start_monotonic = None
+            if hasattr(self, "folder_transmit_btn"):
+                self.folder_transmit_btn.configure(
+                    state="normal" if self.selected_folder_song is not None else "disabled")
+            if hasattr(self, "folder_stop_btn"):
+                self.folder_stop_btn.configure(state="disabled")
+            if hasattr(self, "folder_browse_btn"):
+                self.folder_browse_btn.configure(state="normal")
         self.after(0, _finish)
 
     def _finish_transmit_safe(self):
         def _finish():
             self.is_transmitting = False
+            self.playback_start_monotonic = None
             self.transmit_btn.configure(state="normal")
             self.browse_btn.configure(state="normal")
             self.stop_btn.configure(state="disabled")
         self.after(0, _finish)
 
-    # -----------------------------------------------------------------------
-    # MIDI visualiser integration
-    # -----------------------------------------------------------------------
-
-    def _create_visualiser_bootstrap_song(self) -> Path:
-        """Create a tiny .mid file so the visualiser can open at app startup."""
-        bootstrap_path = Path(self.visualiser_temp_dir.name) / "_bootstrap_visualiser.mid"
-        if bootstrap_path.exists():
-            return bootstrap_path
-
-        mid = mido.MidiFile()
-        track = mido.MidiTrack()
-        mid.tracks.append(track)
-        track.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
-        track.append(mido.Message("note_on", note=60, velocity=1, time=0))
-        track.append(mido.Message("note_off", note=60, velocity=0, time=1))
-        mid.save(bootstrap_path)
-        return bootstrap_path
-
-    def _open_visualiser_on_startup(self) -> None:
-        """Open the visualiser window alongside the GUI before any song upload."""
-        if Visualiser is None or self._visualiser_alive():
-            return
-
-        try:
-            bootstrap_path = self._create_visualiser_bootstrap_song()
-            self._open_visualiser_window(bootstrap_path, SongData(filename="Waiting for Upload"))
-            self.visualiser_filename = "Waiting for Upload"
-            self.visualiser_composer = "--"
-            self.visualiser_duration_sec = 0.0
-            self.visualiser_paused_progress_sec = 0.0
-            self.visualiser_start_monotonic = None
-            self._update_visualiser_header(0.0)
-        except Exception:
-            # Startup visualiser is best-effort; playback flow will retry as needed.
-            traceback.print_exc()
-
-    def _visualiser_alive(self) -> bool:
-        return self.visualiser_process is not None and self.visualiser_process.is_alive()
-
-    def _send_visualiser_command(self, cmd: str, **payload: Any) -> None:
-        if not self._visualiser_alive() or self.visualiser_queue is None:
-            return
-        try:
-            self.visualiser_queue.put((cmd, payload))
-        except Exception:
-            pass
-
-    def _prepare_visualiser_path(self, midi_path: Path) -> Path:
-        """
-        midi-visualiser currently accepts only .mid input files.
-        If the source song is .midi, create a temporary .mid copy.
-        """
-        suffix = midi_path.suffix.lower()
-        if suffix == ".mid":
-            return midi_path
-
-        if suffix != ".midi":
-            return midi_path
-
-        safe_stem = midi_path.stem.replace(" ", "_")
-        temp_target = Path(self.visualiser_temp_dir.name) / (
-            f"{safe_stem}_{int(time.time() * 1000)}.mid"
-        )
-        shutil.copy2(midi_path, temp_target)
-        return temp_target
-
-    def _open_visualiser_window(self, midi_path: Path, song: SongData) -> None:
-        if Visualiser is None:
-            self._show_warning_safe(
-                "MIDI Visualiser Not Installed",
-                "Install dependencies from requirements.txt to enable synced visualisation.")
-            return
-
-        source_path = midi_path.resolve()
-        midi_path = self._prepare_visualiser_path(source_path)
-        self.visualiser_filename = song.filename
-        self.visualiser_composer = parse_composer_from_filename(source_path) or "Unknown"
-        self.visualiser_duration_sec = song.duration_sec
-        self.visualiser_paused_progress_sec = 0.0
-        self.visualiser_start_monotonic = None
-
-        if self._visualiser_alive():
-            self._load_visualiser_song(midi_path)
-            self._update_visualiser_header(0.0)
-            self._ensure_visualiser_header_loop()
-            return
-
-        self.visualiser_queue = mp.Queue()
-        self.visualiser_process = mp.Process(
-            target=_visualiser_process_main,
-            args=(str(midi_path), self.visualiser_queue),
-            daemon=True,
-        )
-        self.visualiser_process.start()
-        self.visualiser_loaded_path = midi_path
-        self._update_visualiser_header(0.0)
-        self._ensure_visualiser_header_loop()
-
-    def _load_visualiser_song(self, midi_path: Path) -> None:
-        if not self._visualiser_alive():
-            return
-
-        already_loaded = self.visualiser_loaded_path == midi_path
-        if already_loaded:
-            return
-
-        self._send_visualiser_command("load", path=str(midi_path))
-        self.visualiser_loaded_path = midi_path
-
-    def _start_visualiser_playback(self, song: SongData | None = None,
-                                   song_path: Path | None = None) -> None:
-        if Visualiser is None:
-            return
-
-        if song is None:
-            song = self.song
-        if song is None:
-            return
-
-        if song_path is None:
-            song_path = self.song_source_path
-        if song_path is None:
-            return
-
-        self._open_visualiser_window(song_path, song)
-        self.visualiser_start_monotonic = time.monotonic()
-        self.visualiser_paused_progress_sec = 0.0
-
-        self._send_visualiser_command("start")
-
-        self._update_visualiser_header(0.0)
-        self._ensure_visualiser_header_loop()
-
-    def _pause_visualiser_playback(self) -> None:
-        if Visualiser is None:
-            return
-
-        progress = self._get_visualiser_progress_sec()
-        self.visualiser_paused_progress_sec = progress
-        self.visualiser_start_monotonic = None
-
-        self._send_visualiser_command("pause")
-
-        self._update_visualiser_header(progress)
-
-    def _get_visualiser_progress_sec(self) -> float:
-        if self.visualiser_start_monotonic is None:
-            return min(self.visualiser_paused_progress_sec, self.visualiser_duration_sec)
-
-        elapsed = max(0.0, time.monotonic() - self.visualiser_start_monotonic)
-        return min(elapsed, self.visualiser_duration_sec)
-
-    def _update_visualiser_header(self, progress_sec: float | None = None) -> None:
-        if not self._visualiser_alive():
-            return
-
-        if progress_sec is None:
-            progress_sec = self._get_visualiser_progress_sec()
-
-        header = (
-            f"Filename: {self.visualiser_filename} | "
-            f"Composer: {self.visualiser_composer} | "
-            f"Song Duration: {self.visualiser_duration_sec:.1f}s | "
-            f"Current Song Progress: {progress_sec:.1f}s"
-        )
-        self._send_visualiser_command("header", text=header)
-
-    def _ensure_visualiser_header_loop(self) -> None:
-        if self.visualiser_header_job is not None:
-            return
-
-        def _tick() -> None:
-            self.visualiser_header_job = None
-            if not self._visualiser_alive():
-                return
-
-            self._update_visualiser_header()
-            self.visualiser_header_job = self.after(200, _tick)
-
-        self.visualiser_header_job = self.after(200, _tick)
-
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Main
 # ---------------------------------------------------------------------------
 
-def main():
-    ctk.set_appearance_mode("light")
-    ctk.set_default_color_theme("blue")
+if __name__ == "__main__":
     app = SolenoidPianoApp()
     app.mainloop()
-
-
-if __name__ == '__main__':
-    main()
