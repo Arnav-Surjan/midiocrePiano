@@ -1243,7 +1243,9 @@ class VisualizerWindow(ctk.CTkToplevel):
         start_mono = app.playback_start_monotonic
         offset_us  = app.playback_time_offset_us
 
-        if app.is_transmitting and start_mono is not None:
+        # Drive the visualizer from the playback clock itself, not from the
+        # upload/worker lifecycle flag. Upload may finish before playback ends.
+        if start_mono is not None:
             elapsed_s = time.monotonic() - start_mono
             return offset_us + int(elapsed_s * 1_000_000)
 
@@ -2528,6 +2530,26 @@ class SolenoidPianoApp(ctk.CTk):
 
     def _transmit_worker_folder(self, port: str, baud: int, song: SongData):
         ser: serial.Serial | None = None
+
+        def current_song_position_us() -> int:
+            if self.playback_start_monotonic is None:
+                return 0
+            elapsed_us = int(
+                (time.monotonic() - self.playback_start_monotonic) * 1_000_000)
+            return elapsed_us
+
+        def handle_stop():
+            pos = current_song_position_us()
+            self._paused_song_us = pos
+            try:
+                send_packet(ser, build_command_packet(CMD_STOP))
+                wait_for_ack(ser)
+            except Exception:
+                pass
+            self._set_folder_status_safe(
+                f"Stopped at {pos / 1_000_000:.2f}s — "
+                f"press Upload & Play to resume from start")
+
         try:
             self._set_folder_status_safe(f"Connecting to {port}...")
             ser = serial.Serial(port, baud, timeout=ACK_TIMEOUT_S)
@@ -2554,8 +2576,7 @@ class SolenoidPianoApp(ctk.CTk):
 
             while sent < total:
                 if not self.is_transmitting:
-                    self._set_folder_status_safe("Transmission cancelled.")
-                    send_packet(ser, build_command_packet(CMD_STOP))
+                    handle_stop()
                     return
 
                 batch = song.events[sent:sent + BATCH_SIZE]
@@ -2563,8 +2584,7 @@ class SolenoidPianoApp(ctk.CTk):
 
                 while free < batch_len:
                     if not self.is_transmitting:
-                        self._set_folder_status_safe("Transmission cancelled.")
-                        send_packet(ser, build_command_packet(CMD_STOP))
+                        handle_stop()
                         return
                     time.sleep(BACKPRESSURE_POLL_S)
                     send_packet(ser, build_command_packet(CMD_PING))
@@ -2614,6 +2634,19 @@ class SolenoidPianoApp(ctk.CTk):
             self._update_folder_progress_safe(1.0)
             self._set_folder_status_safe(
                 f"Playing: {song.filename} ({song.duration_sec:.1f}s, {song.tempo_bpm:.0f} BPM)")
+
+            deadline = (self.playback_start_monotonic
+                        + song.duration_us / 1_000_000
+                        + 0.5)
+
+            while time.monotonic() < deadline:
+                if not self.is_transmitting:
+                    handle_stop()
+                    return
+                time.sleep(0.1)
+
+            self._paused_song_us = None
+            self._set_folder_status_safe(f"Finished: {song.filename}")
 
         except serial.SerialException as e:
             self._show_error_safe("Serial Error", str(e))
